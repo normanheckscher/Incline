@@ -12,3 +12,4 @@ pub(crate) mod relimit;
 pub(crate) mod rotate_collar;
 pub(crate) mod selection;
 pub(crate) mod split;
+pub(crate) mod thin;

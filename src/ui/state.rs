@@ -434,6 +434,7 @@ impl EditorState {
             || self.reference_surface_dialog.is_some()
             || self.thickness_points_dialog.is_some()
             || self.seam_surface_dialog.is_some()
+            || self.thin_strings_dialog.is_some()
             // Its limits are picked from the view, so the lock lifts while a
             // pick is armed.
             || (self.tri_cut_to_open && self.triangulation_pick_target.is_none())
@@ -1668,6 +1669,9 @@ pub(crate) struct EditorState {
     /// document the counts are derived from.
     pub(crate) selection_counts: SelectionCounts,
     pub(crate) insert_point_at_elevation_dialog: Option<crate::ui::dialogs::InsertPointAtElevationDialog>,
+    pub(crate) thin_strings_dialog: Option<crate::ui::dialogs::ThinStringsDialog>,
+    /// The tolerance Thin Strings opens with: the last one applied.
+    pub(crate) thin_tolerance: f64,
     /// The "Edit Object" dialog, holding a working copy of one design object
     /// until Apply or OK hands it back to the document.
     pub(crate) object_edit_dialog: Option<crate::ui::dialogs::object_edit::ObjectEditDialog>,
@@ -2452,6 +2456,7 @@ impl EditorState {
             || self.move_to_layer_dialog.is_some()
             || self.move_to_axis_dialog.is_some()
             || self.insert_point_at_elevation_dialog.is_some()
+            || self.thin_strings_dialog.is_some()
             || self.new_layer_dialog_open
             || self.survey.definitions_open
             || self.survey.transform_open
@@ -2765,6 +2770,7 @@ impl EditorState {
         self.move_to_layer_dialog = None;
         self.move_to_axis_dialog = None;
         self.insert_point_at_elevation_dialog = None;
+        self.thin_strings_dialog = None;
         self.object_edit_dialog = None;
         self.measurement_start = None;
         self.measurement_end = None;
@@ -3065,6 +3071,8 @@ impl EditorState {
             selection_has_polylines: false,
             selection_counts: SelectionCounts::default(),
             insert_point_at_elevation_dialog: None,
+            thin_strings_dialog: None,
+            thin_tolerance: crate::app::commands::drawing::thin::DEFAULT_THIN_TOLERANCE,
             object_edit_dialog: None,
             xray_enabled: false,
             cinematic_enabled: false,
@@ -4355,6 +4363,15 @@ pub(crate) enum UiCommand {
         object_ids: Vec<ObjectId>,
         elevation: f64,
     },
+    /// Open Thin Strings on the selected strings.
+    OpenThinStringsDialog,
+    /// Preview Thin Strings at a new tolerance.
+    SetThinTolerance(f64),
+    /// Drop the vertices each string does not need within `tolerance`.
+    ThinStrings {
+        object_ids: Vec<ObjectId>,
+        tolerance: f64,
+    },
     /// Run CDT on the supplied object list and add the result as a loaded triangulation.
     ExecuteCreateTriangulation {
         name: String,
@@ -4579,6 +4596,8 @@ impl UiCommand {
             | Self::OpenCreateTriangulation
             | Self::OpenMoveToAxisDialog(_)
             | Self::OpenInsertPointAtElevationDialog
+            | Self::OpenThinStringsDialog
+            | Self::SetThinTolerance(_)
             | Self::OpenObjectEditDialog(_)
             | Self::ShowObjectVertex { .. }
             | Self::ArmDrapeAlongTriangles
@@ -4882,6 +4901,10 @@ impl UiCommand {
             Self::InsertPointsAtElevation { object_ids, elevation } => report(
                 tr!("state-insert-points-elevation"),
                 tr!("state-count-object-s-z-elevation", count = object_ids.len().to_string(), elevation = elevation.to_string()),
+            ),
+            Self::ThinStrings { object_ids, tolerance } => report(
+                tr!("state-thin-strings"),
+                tr!("state-count-object-s-tolerance", count = object_ids.len().to_string(), tolerance = tolerance.to_string()),
             ),
             Self::ExecuteCreateTriangulation { name, object_ids, .. }
             | Self::ExecuteCreateTriangulationWithWeld { name, object_ids, .. }

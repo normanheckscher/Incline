@@ -77,6 +77,8 @@ impl<'a> App<'a> {
         // references dangling. Both are settled by the same sweep.
         self.drop_editor_references_to_missing_items();
         self.apply_step_effects(effects);
+        // An open Thin Strings dialog previews the strings as they were.
+        self.refresh_thin_preview(true);
         self.invalidate_geometry();
     }
 
@@ -1231,6 +1233,18 @@ impl<'a> App<'a> {
             }
             UiCommand::InsertPointsAtElevation { object_ids, elevation } => {
                 self.insert_points_at_elevation(object_ids, elevation);
+                Ok(())
+            }
+            UiCommand::OpenThinStringsDialog => {
+                self.open_thin_strings_dialog();
+                Ok(())
+            }
+            UiCommand::SetThinTolerance(tolerance) => {
+                self.set_thin_tolerance(tolerance);
+                Ok(())
+            }
+            UiCommand::ThinStrings { object_ids, tolerance } => {
+                self.thin_strings(object_ids, tolerance);
                 Ok(())
             }
             UiCommand::CommitBatterBerm => {

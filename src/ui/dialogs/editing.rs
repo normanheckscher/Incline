@@ -405,6 +405,77 @@ pub(crate) fn draw_insert_point_at_elevation_dialog(ui: &mut egui::Ui, editor: &
     }
 }
 
+/// Thin Strings: a tolerance typed or slid, the strings as they would be
+/// drawn over the scene, Apply to keep it. Nothing changes until Apply.
+pub(crate) fn draw_thin_strings_dialog(ui: &mut egui::Ui, editor: &mut EditorState, commands: &mut Vec<UiCommand>) {
+    let Some(dialog) = editor.thin_strings_dialog.as_mut() else {
+        return;
+    };
+
+    let object_count = dialog.object_ids.len();
+    let mut close = false;
+    let mut apply = false;
+    let mut open = true;
+    let mut tolerance = dialog.tolerance;
+
+    DragableMenu::new("thin_strings_dialog", tr!("edit-thin-strings"))
+        .open(&mut open)
+        .min_width(280.0)
+        .max_width(320.0)
+        .show(ui.ctx(), |ui| {
+            MenuFieldF64::new(tr!("edit-thin-tolerance"), &mut tolerance, 0.0..=f64::MAX)
+                .help_text(tr!("edit-thin-tolerance-help"))
+                .speed(0.01)
+                .max_decimals(3)
+                .suffix(format!(" {}", tr!("common-m")))
+                .width(120.0)
+                .show(ui);
+            let top = (dialog.slider_max * 1.1).max(0.01);
+            MenuField::new("").show(ui, |ui, _, width| {
+                let mut slid = tolerance.min(top);
+                if ui
+                    .add_sized(
+                        [width, ui.spacing().interact_size.y],
+                        egui::Slider::new(&mut slid, 0.0..=top).logarithmic(true).show_value(false),
+                    )
+                    .changed()
+                {
+                    tolerance = slid;
+                }
+            });
+            ui.label(tr!("edit-thin-vertex-count", before = dialog.before.to_string(), after = dialog.after.to_string()));
+            ui.add_space(4.0);
+            // A tolerance changed this frame has no preview yet, so Apply
+            // waits a frame for it rather than acting on one not shown.
+            let can_apply = tolerance == dialog.tolerance && dialog.after < dialog.before;
+            let submitted = menu::dialog_confirm_pressed(ui.ctx());
+            let cancelled = menu::dialog_cancel_pressed(ui.ctx());
+            menu::menu_actions(ui, |ui| {
+                if (submitted || ui.add(MenuButton::new(tr!("edit-apply")).primary().enabled(can_apply)).clicked()) && can_apply {
+                    apply = true;
+                }
+                if ui.add(MenuButton::new(tr!("common-cancel"))).clicked() || cancelled {
+                    close = true;
+                }
+            });
+            ui.label(tr!("ui-selected-polylines", count = object_count));
+        });
+
+    if tolerance.is_finite() && tolerance != dialog.tolerance {
+        dialog.tolerance = tolerance;
+        commands.push(UiCommand::SetThinTolerance(tolerance));
+    }
+    if apply {
+        commands.push(UiCommand::ThinStrings {
+            object_ids: dialog.object_ids.clone(),
+            tolerance: dialog.tolerance,
+        });
+        editor.thin_strings_dialog = None;
+    } else if close || !open {
+        editor.thin_strings_dialog = None;
+    }
+}
+
 /// Draw the welcome splash the application starts on.
 ///
 /// A project is already open behind it - startup lands on an empty, never-saved

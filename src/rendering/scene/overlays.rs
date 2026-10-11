@@ -92,6 +92,15 @@ pub(crate) fn rebuild_editor_overlay(input: OverlaySceneBuildInput<'_>) {
     }
 
     draw_tie_preview(&mut overlay, editor);
+    // Thin Strings: each string as Apply would leave it, and what it keeps.
+    if let Some(dialog) = &editor.thin_strings_dialog {
+        for (verts, closed) in &dialog.preview {
+            tessellate_polyline_stroke(&mut overlay, verts, *closed, DOC_LINE_WIDTH, PREVIEW_COLOR);
+            for vertex in verts {
+                draw_screen_point_marker(&mut overlay, vertex.pos, ACTIVE_POINT_COLOR);
+            }
+        }
+    }
     if editor.poly_finish_dialog {
         // Dialog is open: draw a dashed closing line from last point to first point.
         // Dash size is fixed in screen pixels so it stays visible at any zoom level.

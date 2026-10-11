@@ -375,6 +375,11 @@ impl<'a> Graphics<'a> {
             self.cached_poly_finish_dialog = editor.poly_finish_dialog;
             self.overlay_dirty = true;
         }
+        let thin_preview = editor.thin_strings_dialog.as_ref().map(|dialog| dialog.preview_generation);
+        if thin_preview != self.cached_thin_preview {
+            self.cached_thin_preview = thin_preview;
+            self.overlay_dirty = true;
+        }
 
         if self.overlay_dirty {
             let overlay_vp = self.view_proj();

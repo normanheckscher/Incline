@@ -144,6 +144,12 @@ fn drawing_tools(ui: &egui::Ui, editor: &EditorState, editing_enabled: bool, pro
             LeftToolAction::Command(Box::new(UiCommand::ReverseSelectedStrings)),
             editor.selection_has_polylines,
         ),
+        cell(
+            themed_icon!(ui, "thin_string.svg"),
+            tr!("toolbars-thin-strings"),
+            LeftToolAction::Command(Box::new(UiCommand::OpenThinStringsDialog)),
+            editor.selection_has_polylines,
+        ),
     ]);
     tools
 }

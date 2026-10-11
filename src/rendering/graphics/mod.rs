@@ -458,6 +458,8 @@ pub(crate) struct Graphics<'a> {
     pub(super) cached_scale_factor: f32,
     pub(super) cached_measurement_state: (bool, Option<DVec3>, Option<DVec3>, Vec<DVec3>),
     pub(super) cached_poly_finish_dialog: bool,
+    /// Which Thin Strings preview the overlay last drew, if one was open.
+    pub(super) cached_thin_preview: Option<u64>,
     pub(super) pick_records: Vec<PickRecord>,
     pub(super) text_pick_records: Vec<TextPickRecord>,
     pub(super) document_draw_batches: Vec<DocumentDrawBatch>,

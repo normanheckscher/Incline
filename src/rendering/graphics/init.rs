@@ -867,6 +867,7 @@ impl<'a> Graphics<'a> {
             cached_scale_factor: 0.0,
             cached_measurement_state: (false, None, None, Vec::new()),
             cached_poly_finish_dialog: false,
+            cached_thin_preview: None,
             pick_records: Vec::new(),
             text_pick_records: Vec::new(),
             document_draw_batches: Vec::new(),
