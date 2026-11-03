@@ -1,0 +1,156 @@
+name: Geology lane test build
+
+# Test builds of the geology lane, published as pre-releases on this fork
+# only. This workflow lives on the fork-only branch release-geology, which
+# is geology-tooling plus this file, merged forward after every landing; a
+# push here builds the lane tip and publishes it. It never runs on, or
+# publishes to, the upstream repository. Derived from upstream's
+# .github/workflows/release.yml (MIT): same build steps, same pinned
+# actions; the version gate is replaced by a geology-tooling sha gate.
+on:
+  push:
+    branches: [release-geology]
+
+permissions:
+  contents: write # create the tag and the pre-release
+
+# Never cancel in flight: a superseded run could already be creating the tag
+# and the release, and killing it would leave that half done.
+concurrency:
+  group: release-geology
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lane:
+    name: Read the lane tip
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.read.outputs.sha }}
+      date: ${{ steps.read.outputs.date }}
+      tag: ${{ steps.read.outputs.tag }}
+      release: ${{ steps.read.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags and geology-tooling, to name and gate the build
+
+      # The build is named after the geology-tooling commit it carries, not
+      # after the merge commit on this branch, so a push that changes only
+      # this file (same lane tip) publishes nothing.
+      - id: read
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch -q origin geology-tooling
+          lane=$(git merge-base HEAD origin/geology-tooling)
+          sha=$(git rev-parse --short=8 "$lane")
+          date=$(date -u +%Y%m%d)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "date=$date" >> "$GITHUB_OUTPUT"
+          echo "tag=geology-$date-$sha" >> "$GITHUB_OUTPUT"
+          if git tag --list "geology-*-$sha" | grep -q .; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::geology-tooling $sha already has a test build - nothing to do."
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Building geology-tooling $sha as geology-$date-$sha."
+          fi
+
+  build:
+    name: Build linux-x86_64
+    needs: lane
+    if: needs.lane.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang mold libgtk-3-dev libxkbcommon-dev
+
+      # rust-toolchain.toml pins nightly and lists the components (rust-src for
+      # build-std) and targets; `rustup show` is what makes rustup honour it.
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      # No build cache: a test build is built clean from the tagged commit.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          name="Incline-geology-${{ needs.lane.outputs.date }}-${{ needs.lane.outputs.sha }}-linux-x86_64"
+          cp target/release/incline-design "target/release/$name"
+          tar -czf "out/$name.tar.gz" -C target/release "$name"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux-x86_64
+          path: out/*
+          if-no-files-found: error
+
+  windows:
+    name: Build windows-x86_64
+    needs: lane
+    if: needs.lane.outputs.release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The binary ships unsigned: Windows will show a SmartScreen warning on
+      # first run.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out staged
+          name="Incline-geology-${{ needs.lane.outputs.date }}-${{ needs.lane.outputs.sha }}-windows-x86_64"
+          cp target/release/incline-design.exe "staged/$name.exe"
+          7z a "out/$name.zip" "./staged/$name.exe"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-x86_64
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the test build
+    needs: [lane, build, windows]
+    if: needs.lane.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Create the pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The tag does not exist (the lane job would have stopped the run
+          # otherwise), so this creates it at the commit that was built.
+          gh release create "${{ needs.lane.outputs.tag }}" artifacts/* \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Geology lane test build ${{ needs.lane.outputs.date }} (geology-tooling ${{ needs.lane.outputs.sha }})" \
+            --notes "Test build of the geology lane at geology-tooling ${{ needs.lane.outputs.sha }}, published from this fork for geologists trying the work in progress. Not an Incline release: Incline releases come from Incline-Developers/Incline-Design. Unsigned binaries; the web build is not included."
