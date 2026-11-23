@@ -39,6 +39,8 @@ impl App<'_> {
             ToolSubject::ContourSurface(id) => self.set_contour_surface(id),
             ToolSubject::SmoothSurface(id) => self.set_smooth_surface(id),
             ToolSubject::CleanSurface(id) => self.set_clean_surface(id),
+            ToolSubject::WaterSurface(id) => self.set_water_surface(id),
+            ToolSubject::SimplifySurface(id) => self.set_simplify_surface(id),
             ToolSubject::OreBlockModel(id) => self.set_ore_block_model(id),
             ToolSubject::BlockModelDrillholes(id) => self.open_create_block_model_dialog(id, None),
             ToolSubject::TinPointCloud(id) => self.set_tin_point_cloud(id),
@@ -110,6 +112,43 @@ impl App<'_> {
         self.editor.tri_cut_z_limits = (bounds.min.z, bounds.max.z);
     }
 
+    /// Open Rain Simulation. The storm it last ran stays as it was set.
+    pub(crate) fn open_water_surface(&mut self) {
+        self.editor.water_dialog.open = true;
+        self.editor.water_dialog.surface = None;
+        self.editor.tri_hover_handles.clear();
+        if let Some(id) = only(&self.selected_triangulations()) {
+            self.set_water_surface(id);
+        }
+    }
+
+    fn set_water_surface(&mut self, id: TriangulationId) {
+        if self.triangulations.iter().any(|surface| surface.id == id && surface.state.loaded) {
+            self.editor.water_dialog.surface = Some(id);
+        }
+    }
+
+    /// Open Simplify. How far it last thinned stays as it was set.
+    pub(crate) fn open_simplify_surface(&mut self) {
+        self.editor.simplify_dialog.open = true;
+        self.editor.simplify_dialog.surface = None;
+        self.editor.simplify_dialog.faces = 0;
+        self.editor.simplify_dialog.name.clear();
+        self.editor.tri_hover_handles.clear();
+        if let Some(id) = only(&self.selected_triangulations()) {
+            self.set_simplify_surface(id);
+        }
+    }
+
+    fn set_simplify_surface(&mut self, id: TriangulationId) {
+        let Some(surface) = self.triangulations.iter().find(|surface| surface.id == id && surface.state.loaded) else {
+            return;
+        };
+        self.editor.simplify_dialog.name = crate::app::canvas::derived_triangulation_name(&surface.name, &tr!("simplify-name-suffix"));
+        self.editor.simplify_dialog.faces = surface.mesh.face_count();
+        self.editor.simplify_dialog.surface = Some(id);
+    }
+
     pub(crate) fn open_contour_surface(&mut self) {
         self.editor.tri_contour_open = true;
         self.editor.tri_contour_tri_id = None;
@@ -155,7 +194,7 @@ impl App<'_> {
         let name = surface.name.clone();
         self.editor.tri_smooth_surface_id = Some(id);
         if self.editor.tri_smooth_name_auto {
-            self.editor.tri_smooth_name_input = crate::app::canvas::derived_triangulation_name(&name, &tr!("cmd-commands-smoothed"));
+            self.editor.tri_smooth_name_input = crate::app::canvas::derived_surface_name(&name, &tr!("cmd-commands-smoothed"));
         }
     }
 
@@ -176,7 +215,7 @@ impl App<'_> {
         let name = surface.name.clone();
         self.editor.tri_clean_surface_id = Some(id);
         if self.editor.tri_clean_name_auto {
-            self.editor.tri_clean_name_input = crate::app::canvas::derived_triangulation_name(&name, &tr!("cmd-commands-cleaned"));
+            self.editor.tri_clean_name_input = crate::app::canvas::derived_surface_name(&name, &tr!("cmd-commands-cleaned"));
         }
     }
 
@@ -538,11 +577,19 @@ impl App<'_> {
         // layer's points and the flagged list in a settled order.
         holes.sort_unstable_by_key(|hole| (hole.dataset.0, hole.hole));
         match self.editor.reference_points_dialog.as_mut() {
-            Some(draft) => draft.holes = holes,
+            Some(draft) => {
+                draft.holes = holes;
+                draft.codes = None;
+            }
             None => {
                 // The seam last chosen comes back, so it is chosen once.
                 let seam = self.editor.last_seam.clone().unwrap_or_default();
-                self.editor.reference_points_dialog = Some(ReferencePointsDraft { holes, seam, collars: false });
+                self.editor.reference_points_dialog = Some(ReferencePointsDraft {
+                    holes,
+                    seam,
+                    codes: None,
+                    collars: false,
+                });
             }
         }
     }

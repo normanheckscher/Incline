@@ -9,8 +9,9 @@ use crate::{
         Document, FillStyle, ObjectColor, ObjectId, SceneEntityId,
         block_model::{BlockModelId, OpenBlockModel},
         drill_hole::DrillColorPreset,
+        numbers::format_quantity,
         prismoid_grid::{PrismoidColorBy, PrismoidGridId, ValueSpread},
-        project::{LATTICE_UNIT, ModelEnvelope, ModellingSettings},
+        project::{LATTICE_UNIT, MIN_STEEP_DISTANCE, ModelEnvelope, ModellingSettings},
     },
     rendering::color::{color32_to_rgba, rgba_to_color32},
     ui::{
@@ -239,7 +240,7 @@ enum PrismoidKeyBar {
 /// The key's words for the value a grid is coloured by, or for its vertical
 /// thickness with `None`.
 fn prismoid_key_text(spread: Option<&ValueSpread>, thickness: (f64, f64)) -> PrismoidKeyText {
-    let ends = |(min, max): (f64, f64)| PrismoidKeyBar::Ends(format!("{min:.2}"), format!("{max:.2}"));
+    let ends = |(min, max): (f64, f64)| PrismoidKeyBar::Ends(format_quantity(min, 2), format_quantity(max, 2));
     let Some(spread) = spread else {
         return PrismoidKeyText {
             title: tr!("viewport-prismoid-value-unit", value = tr!("thickness-points-column-vertical"), unit = "m".to_owned()),
@@ -835,7 +836,7 @@ fn draw_modelling_settings(ui: &mut egui::Ui, modelling: Option<(u32, &Modelling
     let responses = [
         // Every range here is exactly what `ModellingSettings::problem` accepts:
         // a narrower one would clamp a loaded value just by being drawn.
-        MenuFieldF64::new(tr!("properties-steep-pair-distance"), &mut settings.steep_distance, f64::MIN_POSITIVE..=f64::MAX)
+        MenuFieldF64::new(tr!("properties-steep-pair-distance"), &mut settings.steep_distance, MIN_STEEP_DISTANCE..=f64::MAX)
             .suffix(" m")
             .max_decimals(2)
             .help_text(tr!("properties-steep-pair-distance-help"))

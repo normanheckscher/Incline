@@ -1019,6 +1019,40 @@ fn trim_blocker(topography: Option<Option<(&str, &crate::model::triangulation::Q
     (!(0.0..=1.0).contains(&allowance)).then(|| tr!("tri-prismoid-trim-touching-range"))
 }
 
+/// Why Clip to Surface cannot run yet, from the number of seam surfaces
+/// chosen and the two limit rows (an `Err` is the reason a row cannot be read
+/// as typed), and the refusal of a chosen quality surface, if any; `None` when
+/// it can. A depth below the surface Keep below follows is a second limit,
+/// the same surface twice is none.
+fn clip_to_surface_blocker(seam: usize, upper: Result<&Option<TriUpperCut>, &String>, lower: Result<&Option<TriLowerCut>, &String>, quality: Option<&str>) -> Option<String> {
+    if seam != 2 {
+        return Some(tr!("cmd-cuts-to-surface-select-seam"));
+    }
+    let (upper, lower) = match (upper, lower) {
+        (Err(reason), _) | (_, Err(reason)) => return Some(reason.clone()),
+        (Ok(upper), Ok(lower)) => (upper, lower),
+    };
+    if upper.is_none() && lower.is_none() {
+        return Some(tr!("cmd-cuts-to-surface-no-cut"));
+    }
+    if matches!((upper, lower), (Some(TriUpperCut::Surface(above)), Some(TriLowerCut::Surface(below))) if above == below) {
+        return Some(tr!("cmd-cuts-to-surface-same-limit"));
+    }
+    quality.map(str::to_owned)
+}
+
+/// The refusal for the first of the chosen surfaces, in the order given, that
+/// is a quality surface, as the tools that take RLs give it; `None` when
+/// none is.
+fn quality_refusal(entries: &[crate::ui::state::UiTriangulationEntry], chosen: impl IntoIterator<Item = TriangulationId>) -> Option<String> {
+    chosen.into_iter().find_map(|id| {
+        let entry = entries.iter().find(|entry| entry.id == id)?;
+        crate::app::commands::triangulation::session::refuse_quality(&entry.name, entry.quality.as_ref())
+            .err()
+            .map(|refusal| refusal.to_string())
+    })
+}
+
 /// Clip to Surface: the seam's roof and floor, chosen in either slot, are
 /// clipped to the Keep below and Keep above limits, into a new roof, floor
 /// and solid. Each limit is a surface, the usual choice, or a typed RL; Keep
@@ -1103,12 +1137,17 @@ pub(crate) fn draw_cut_to_surface_dialog(ui: &mut egui::Ui, editor: &mut EditorS
                 TriCutSource::Depth => tr!("tri-clip-to-surface-from-depth"),
             };
             // Empty text is an empty row; anything else must read as a number.
-            let level_of = |input: &str| -> Result<Option<f64>, ()> {
+            let level_of = |input: &str| -> Result<Option<f64>, String> {
                 let input = input.trim();
                 if input.is_empty() {
                     return Ok(None);
                 }
-                input.parse::<f64>().ok().filter(|level| level.is_finite()).map(Some).ok_or(())
+                input
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|level| level.is_finite())
+                    .map(Some)
+                    .ok_or_else(|| tr!("tri-clip-to-surface-level-invalid"))
             };
 
             // Keep below: a surface or an RL. Ok(None) is a row left empty,
@@ -1124,7 +1163,7 @@ pub(crate) fn draw_cut_to_surface_dialog(ui: &mut egui::Ui, editor: &mut EditorS
             .help_text(tr!("tri-clip-to-surface-upper-help"))
             .width(picker_control_width(ui))
             .show(ui);
-            let upper: Result<Option<TriUpperCut>, ()> = match editor.tri_cut_to_upper_source {
+            let upper: Result<Option<TriUpperCut>, String> = match editor.tri_cut_to_upper_source {
                 TriCutSource::Level => {
                     MenuFieldText::new(tr!("tri-clip-to-surface-level"), &mut editor.tri_cut_to_upper_level_input)
                         .help_text(tr!("tri-clip-to-surface-level-help"))
@@ -1167,7 +1206,7 @@ pub(crate) fn draw_cut_to_surface_dialog(ui: &mut egui::Ui, editor: &mut EditorS
             .help_text(tr!("tri-clip-to-surface-lower-help"))
             .width(picker_control_width(ui))
             .show(ui);
-            let lower: Result<Option<TriLowerCut>, ()> = match editor.tri_cut_to_lower_source {
+            let lower: Result<Option<TriLowerCut>, String> = match editor.tri_cut_to_lower_source {
                 TriCutSource::Level => {
                     MenuFieldText::new(tr!("tri-clip-to-surface-level"), &mut editor.tri_cut_to_lower_level_input)
                         .help_text(tr!("tri-clip-to-surface-level-help"))
@@ -1211,7 +1250,7 @@ pub(crate) fn draw_cut_to_surface_dialog(ui: &mut egui::Ui, editor: &mut EditorS
                         match (editor.tri_cut_to_lower_id, depth) {
                             (None, _) => Ok(None),
                             (Some(ground), Some(depth)) => Ok(Some(TriLowerCut::Depth { ground, depth })),
-                            (Some(_), None) => Err(()),
+                            (Some(_), None) => Err(tr!("project-cut-depth-positive")),
                         }
                     } else {
                         Ok(editor.tri_cut_to_lower_id.map(TriLowerCut::Surface))
@@ -1223,13 +1262,29 @@ pub(crate) fn draw_cut_to_surface_dialog(ui: &mut egui::Ui, editor: &mut EditorS
             // Both seam surfaces, at least one row complete, and no row half
             // typed.
             let targets: Vec<TriangulationId> = seam.iter().flatten().copied().collect();
-            let can_run = targets.len() == 2 && matches!((upper, lower), (Ok(upper), Ok(lower)) if upper.is_some() || lower.is_some());
+            let limit_surfaces = [
+                match upper {
+                    Ok(Some(TriUpperCut::Surface(id))) => Some(id),
+                    _ => None,
+                },
+                match lower {
+                    Ok(Some(TriLowerCut::Surface(id) | TriLowerCut::Depth { ground: id, .. })) => Some(id),
+                    _ => None,
+                },
+            ];
+            let quality = quality_refusal(&project.triangulations, targets.iter().copied().chain(limit_surfaces.into_iter().flatten()));
+            let blocker = clip_to_surface_blocker(targets.len(), upper.as_ref(), lower.as_ref(), quality.as_deref());
+            let can_run = blocker.is_none();
 
             ui.add_space(6.0);
             ui.separator();
             menu::menu_actions(ui, |ui| {
                 let confirm = menu::dialog_confirmed(ui.ctx());
-                if (ui.add(MenuButton::new(tr!("tri-clip")).primary().enabled(can_run)).clicked() || (confirm && can_run))
+                let mut clip = ui.add(MenuButton::new(tr!("tri-clip")).primary().enabled(can_run));
+                if let Some(reason) = blocker.as_deref() {
+                    clip = clip.hint(reason);
+                }
+                if (clip.clicked() || (confirm && can_run))
                     && let (Ok(upper), Ok(lower)) = (upper, lower)
                 {
                     commands.push(UiCommand::ExecuteCutTriangulationToSurface {
@@ -1431,7 +1486,7 @@ pub(crate) fn draw_build_prismoid_grid_dialog(ui: &mut egui::Ui, editor: &mut Ed
                 && editor.tri_prismoid_name_auto
                 && let Some(name) = loaded_name(editor.tri_prismoid_roof_id)
             {
-                editor.tri_prismoid_name_input = crate::app::canvas::derived_triangulation_name(name, &tr!("common-prismoid-grid"));
+                editor.tri_prismoid_name_input = crate::app::canvas::derived_surface_name(name, &tr!("common-prismoid-grid"));
             }
 
             ui.add_space(4.0);
@@ -1619,7 +1674,7 @@ pub(crate) fn draw_build_strata_dialog(ui: &mut egui::Ui, editor: &mut EditorSta
                     .first()
                     .and_then(|row| row.surface)
                     .and_then(loaded_name)
-                    .map(|top| crate::app::canvas::derived_triangulation_name(top, &tr!("common-strata")))
+                    .map(|top| crate::app::canvas::derived_surface_name(top, &tr!("common-strata")))
                     .unwrap_or_default();
             }
             if MenuFieldText::new(tr!("tri-strata-name"), &mut editor.tri_strata_name_input)
@@ -1688,6 +1743,8 @@ fn strata_build_blocker(
         Some(tr!("tri-strata-needs-horizons"))
     } else if intervals.iter().any(|interval| interval.name.trim().is_empty()) {
         Some(tr!("tri-strata-needs-intervals"))
+    } else if !crate::model::prismoid_grid::names_once(intervals.iter().map(|interval| interval.name.as_str())) {
+        Some(tr!("tri-strata-needs-intervals-once"))
     } else if name.trim().is_empty() {
         Some(tr!("tri-strata-needs-name"))
     } else {
@@ -1826,10 +1883,15 @@ pub(crate) fn draw_add_prismoid_qualities_dialog(ui: &mut egui::Ui, editor: &mut
             ui.add_space(6.0);
             ui.separator();
 
-            let can_run = grid.is_some() && !ticked.is_empty() && refusal.is_none();
+            let blocker = add_qualities_blocker(grid.is_some(), ticked.len(), refusal.as_deref());
+            let can_run = blocker.is_none();
             menu::menu_actions(ui, |ui| {
                 let confirm = menu::dialog_confirmed(ui.ctx());
-                if (ui.add(MenuButton::new(tr!("tri-add")).primary().enabled(can_run)).clicked() || (confirm && can_run))
+                let mut add = ui.add(MenuButton::new(tr!("tri-add")).primary().enabled(can_run));
+                if let Some(reason) = blocker.as_deref() {
+                    add = add.hint(reason);
+                }
+                if (add.clicked() || (confirm && can_run))
                     && let Some(grid) = editor.tri_prismoid_qualities_grid
                 {
                     commands.push(UiCommand::ExecuteAddPrismoidQualities {
@@ -1846,6 +1908,39 @@ pub(crate) fn draw_add_prismoid_qualities_dialog(ui: &mut egui::Ui, editor: &mut
 
     if !open {
         editor.tri_prismoid_qualities_open = false;
+    }
+}
+
+/// Why Add Qualities cannot run yet, from whether a loaded grid is chosen,
+/// how many quality surfaces are ticked and the `refusal` of their marks;
+/// `None` when it can.
+fn add_qualities_blocker(grid: bool, ticked: usize, refusal: Option<&str>) -> Option<String> {
+    if !grid {
+        Some(tr!("tri-prismoid-needs-grid"))
+    } else if ticked == 0 {
+        Some(tr!("tri-prismoid-qualities-needs-surfaces"))
+    } else {
+        refusal.map(str::to_owned)
+    }
+}
+
+/// Why Prismoid Grid to Surface cannot run yet, from whether a loaded grid is
+/// chosen and the name; `None` when it can.
+fn prismoid_surface_blocker(grid: bool, name: &str) -> Option<String> {
+    if !grid {
+        Some(tr!("tri-prismoid-needs-grid"))
+    } else {
+        name.trim().is_empty().then(|| tr!("tri-prismoid-needs-name"))
+    }
+}
+
+/// Why Mask Prismoid Grid by Polyline cannot run yet, from whether a loaded
+/// grid and a closed polyline are chosen; `None` when it can.
+fn mask_blocker(grid: bool, polyline: bool) -> Option<String> {
+    if !grid {
+        Some(tr!("tri-prismoid-needs-grid"))
+    } else {
+        (!polyline).then(|| tr!("tri-mask-needs-polyline"))
     }
 }
 
@@ -1904,7 +1999,7 @@ pub(crate) fn draw_prismoid_grid_surface_dialog(ui: &mut egui::Ui, editor: &mut 
             if editor.tri_prismoid_surface_name_auto
                 && let Some(grid) = grid
             {
-                let derived = crate::app::canvas::derived_triangulation_name(&grid.name, &chosen);
+                let derived = crate::app::canvas::derived_surface_name(&grid.name, &chosen);
                 if editor.tri_prismoid_surface_name_input != derived {
                     editor.tri_prismoid_surface_name_input = derived;
                 }
@@ -1920,10 +2015,15 @@ pub(crate) fn draw_prismoid_grid_surface_dialog(ui: &mut egui::Ui, editor: &mut 
             ui.add_space(6.0);
             ui.separator();
 
-            let can_run = grid.is_some() && !editor.tri_prismoid_surface_name_input.trim().is_empty();
+            let blocker = prismoid_surface_blocker(grid.is_some(), &editor.tri_prismoid_surface_name_input);
+            let can_run = blocker.is_none();
             menu::menu_actions(ui, |ui| {
                 let confirm = menu::dialog_confirmed(ui.ctx());
-                if (ui.add(MenuButton::new(tr!("common-ok")).primary().enabled(can_run)).clicked() || (confirm && can_run))
+                let mut ok = ui.add(MenuButton::new(tr!("common-ok")).primary().enabled(can_run));
+                if let Some(reason) = blocker.as_deref() {
+                    ok = ok.hint(reason);
+                }
+                if (ok.clicked() || (confirm && can_run))
                     && let Some(grid) = editor.tri_prismoid_surface_grid
                 {
                     commands.push(UiCommand::ExecutePrismoidGridToSurface {
@@ -2205,11 +2305,16 @@ pub(crate) fn draw_mask_prismoid_grid_dialog(ui: &mut egui::Ui, editor: &mut Edi
             ui.add_space(6.0);
             ui.separator();
 
-            let can_run = grid.is_some() && editor.tri_prismoid_mask_object_id.is_some();
+            let blocker = mask_blocker(grid.is_some(), editor.tri_prismoid_mask_object_id.is_some());
+            let can_run = blocker.is_none();
             let run_label = if editor.tri_prismoid_mask_unmask { tr!("tri-unmask") } else { tr!("tri-mask") };
             menu::menu_actions(ui, |ui| {
                 let confirm = menu::dialog_confirmed(ui.ctx());
-                if (ui.add(MenuButton::new(run_label).primary().enabled(can_run)).clicked() || (confirm && can_run))
+                let mut run = ui.add(MenuButton::new(run_label).primary().enabled(can_run));
+                if let Some(reason) = blocker.as_deref() {
+                    run = run.hint(reason);
+                }
+                if (run.clicked() || (confirm && can_run))
                     && let (Some(grid), Some(polyline_id)) = (editor.tri_prismoid_mask_grid, editor.tri_prismoid_mask_object_id)
                 {
                     commands.push(UiCommand::ExecuteMaskPrismoidGridByPolyline {
@@ -2655,7 +2760,7 @@ pub(crate) fn draw_difference_surfaces_dialog(ui: &mut egui::Ui, editor: &mut Ed
                 && editor.tri_difference_name_auto
                 && editor.tri_difference_upper_id.is_some()
             {
-                editor.tri_difference_name_input = crate::app::canvas::derived_triangulation_name(&name_of(editor.tri_difference_upper_id), &tr!("cmd-commands-difference"));
+                editor.tri_difference_name_input = crate::app::canvas::derived_surface_name(&name_of(editor.tri_difference_upper_id), &tr!("cmd-commands-difference"));
             }
 
             tool_help_panel(ui, tr!("tri-difference-help"));
@@ -2672,18 +2777,12 @@ pub(crate) fn draw_difference_surfaces_dialog(ui: &mut egui::Ui, editor: &mut Ed
             ui.add_space(6.0);
             ui.separator();
 
-            let is_loaded = |id: Option<TriangulationId>| id.is_some_and(|id| loaded.iter().any(|(loaded_id, _)| *loaded_id == id));
-            let blocker = if !is_loaded(editor.tri_difference_upper_id) {
-                Some(tr!("tri-difference-need-upper"))
-            } else if !is_loaded(editor.tri_difference_lower_id) {
-                Some(tr!("tri-difference-need-lower"))
-            } else if editor.tri_difference_upper_id == editor.tri_difference_lower_id {
-                Some(tr!("tri-difference-need-different"))
-            } else if editor.tri_difference_name_input.trim().is_empty() {
-                Some(tr!("tri-difference-need-name"))
-            } else {
-                None
-            };
+            let entry_of = |id: Option<TriangulationId>| project.triangulations.iter().find(|entry| entry.is_loaded && Some(entry.id) == id);
+            let blocker = difference_surfaces_blocker(
+                entry_of(editor.tri_difference_upper_id),
+                entry_of(editor.tri_difference_lower_id),
+                &editor.tri_difference_name_input,
+            );
             let can_run = blocker.is_none();
 
             menu::menu_actions(ui, |ui| {
@@ -2709,6 +2808,27 @@ pub(crate) fn draw_difference_surfaces_dialog(ui: &mut egui::Ui, editor: &mut Ed
     if !open {
         editor.tri_difference_open = false;
     }
+}
+
+/// Why Difference between Surfaces cannot run yet, from the two loaded
+/// surfaces chosen and the name typed; `None` when it can. A quality
+/// surface is refused here as the command refuses it.
+fn difference_surfaces_blocker(upper: Option<&crate::ui::state::UiTriangulationEntry>, lower: Option<&crate::ui::state::UiTriangulationEntry>, name: &str) -> Option<String> {
+    let Some(upper) = upper else {
+        return Some(tr!("tri-difference-need-upper"));
+    };
+    let Some(lower) = lower else {
+        return Some(tr!("tri-difference-need-lower"));
+    };
+    if upper.id == lower.id {
+        return Some(tr!("tri-difference-need-different"));
+    }
+    for surface in [upper, lower] {
+        if let Err(refusal) = crate::app::commands::triangulation::session::refuse_quality(&surface.name, surface.quality.as_ref()) {
+            return Some(refusal.to_string());
+        }
+    }
+    name.trim().is_empty().then(|| tr!("tri-difference-need-name"))
 }
 
 pub(crate) fn draw_contour_dialog(ui: &mut egui::Ui, editor: &mut EditorState, project: &UiProjectView, commands: &mut Vec<UiCommand>) {
@@ -2862,6 +2982,214 @@ pub(crate) fn draw_contour_dialog(ui: &mut egui::Ui, editor: &mut EditorState, p
         });
     if !open {
         editor.tri_contour_open = false;
+    }
+}
+
+/// Rain Simulation: a storm over one surface, run in a tab of its own.
+pub(crate) fn draw_simplify_dialog(ui: &mut egui::Ui, editor: &mut EditorState, project: &UiProjectView, commands: &mut Vec<UiCommand>) {
+    if !editor.simplify_dialog.open || editor.triangulation_pick_target.is_some() {
+        return;
+    }
+    let mut open = true;
+    DragableMenu::new("simplify_triangulation_dialog", tr!("simplify-title"))
+        .open(&mut open)
+        .min_width(PICKER_DIALOG_MIN_WIDTH)
+        .max_width(PICKER_DIALOG_MAX_WIDTH)
+        .show(ui.ctx(), |ui| {
+            let width = picker_control_width(ui);
+            let (chosen, pick) = subject_surface_field(ui, "simplify_surface", editor.simplify_dialog.surface, tr!("simplify-surface-help"), project, width);
+            if let Some(id) = chosen {
+                commands.push(UiCommand::SetToolSubject(ToolSubject::SimplifySurface(id)));
+            }
+            if pick {
+                editor.triangulation_pick_target = Some(TriangulationPickTarget::SimplifySurface);
+            }
+
+            ui.add_space(4.0);
+
+            let dialog = &mut editor.simplify_dialog;
+            MenuFieldF64::new(tr!("simplify-keep"), &mut dialog.keep_percent, 0.1..=99.0)
+                .width(width)
+                .speed(0.5)
+                .max_decimals(1)
+                .suffix(" %")
+                .help_text(tr!("simplify-keep-help"))
+                .show(ui);
+            MenuFieldBool::new(tr!("simplify-limit"), &mut dialog.limit_deviation)
+                .help_text(tr!("simplify-limit-help"))
+                .show(ui);
+            if dialog.limit_deviation {
+                MenuFieldF64::new(tr!("simplify-max-deviation"), &mut dialog.max_deviation, 0.001..=1000.0)
+                    .width(width)
+                    .speed(0.01)
+                    .max_decimals(3)
+                    .suffix(format!(" {}", tr!("common-m")))
+                    .show(ui);
+            }
+
+            ui.add_space(4.0);
+
+            MenuFieldText::new(tr!("tri-create-output-name"), &mut dialog.name)
+                .width(width)
+                .hint_text(tr!("simplify-name-hint"))
+                .show(ui);
+            MenuFieldBool::new(tr!("tri-unload-source-surface"), &mut dialog.unload_source).show(ui);
+
+            let surface = dialog.surface.filter(|id| project.triangulations.iter().any(|entry| entry.id == *id && entry.is_loaded));
+            let keep = dialog.keep_percent / 100.0;
+            if surface.is_some() {
+                let from = crate::model::numbers::format_quantity(dialog.faces as f64, 0);
+                let to = crate::model::numbers::format_quantity((dialog.faces as f64 * keep).round().max(1.0), 0);
+                tool_help_panel(
+                    ui,
+                    if dialog.limit_deviation {
+                        tr!("simplify-note-limited", from = from, to = to)
+                    } else {
+                        tr!("simplify-note", from = from, to = to)
+                    },
+                );
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+
+            let valid = keep.is_finite() && keep > 0.0 && keep < 1.0 && (!dialog.limit_deviation || (dialog.max_deviation.is_finite() && dialog.max_deviation > 0.0));
+            let can_run = surface.is_some() && valid && !dialog.name.trim().is_empty();
+            menu::menu_actions(ui, |ui| {
+                let confirm = menu::dialog_confirmed(ui.ctx());
+                if (ui.add(MenuButton::new(tr!("simplify-run")).primary().enabled(can_run)).clicked() || (confirm && can_run))
+                    && let Some(surface) = surface
+                {
+                    commands.push(UiCommand::SimplifyTriangulation {
+                        surface,
+                        keep,
+                        max_deviation: dialog.limit_deviation.then_some(dialog.max_deviation),
+                        name: dialog.name.trim().to_owned(),
+                        unload_source: dialog.unload_source,
+                    });
+                }
+                if ui.add(MenuButton::new(tr!("common-cancel"))).clicked() || menu::dialog_cancelled(ui.ctx()) {
+                    dialog.open = false;
+                }
+            });
+        });
+    if !open {
+        editor.simplify_dialog.open = false;
+    }
+}
+
+pub(crate) fn draw_water_dialog(ui: &mut egui::Ui, editor: &mut EditorState, project: &UiProjectView, commands: &mut Vec<UiCommand>) {
+    if !editor.water_dialog.open || editor.triangulation_pick_target.is_some() {
+        return;
+    }
+    let mut open = true;
+    DragableMenu::new("simulate_water_dialog", tr!("water-simulate"))
+        .open(&mut open)
+        .min_width(PICKER_DIALOG_MIN_WIDTH)
+        .max_width(PICKER_DIALOG_MAX_WIDTH)
+        .show(ui.ctx(), |ui| {
+            let width = picker_control_width(ui);
+            let (chosen, pick) = subject_surface_field(ui, "water_surface", editor.water_dialog.surface, tr!("water-surface-help"), project, width);
+            if let Some(id) = chosen {
+                commands.push(UiCommand::SetToolSubject(ToolSubject::WaterSurface(id)));
+            }
+            if pick {
+                editor.triangulation_pick_target = Some(TriangulationPickTarget::WaterSurface);
+            }
+
+            let dialog = &mut editor.water_dialog;
+            let unit = |id: String| format!(" {id}");
+            menu::menu_section(ui, tr!("water-section-rain"));
+            MenuFieldF64::new(tr!("water-rain"), &mut dialog.settings.rain_mm, 0.1..=5000.0)
+                .width(width)
+                .speed(1.0)
+                .max_decimals(1)
+                .suffix(unit(tr!("water-unit-mm")))
+                .help_text(tr!("water-rain-help"))
+                .show(ui);
+            MenuFieldF64::new(tr!("water-rain-duration"), &mut dialog.settings.rain_hours, 0.05..=240.0)
+                .width(width)
+                .speed(0.25)
+                .max_decimals(2)
+                .suffix(unit(tr!("water-unit-hours")))
+                .show(ui);
+            MenuFieldF64::new(tr!("water-run-on"), &mut dialog.settings.run_on_hours, 0.0..=240.0)
+                .width(width)
+                .speed(0.25)
+                .max_decimals(2)
+                .suffix(unit(tr!("water-unit-hours")))
+                .help_text(tr!("water-run-on-help"))
+                .show(ui);
+
+            menu::menu_section(ui, tr!("water-section-ground"));
+            MenuFieldF64::new(tr!("water-roughness"), &mut dialog.settings.roughness, 0.005..=0.5)
+                .width(width)
+                .speed(0.001)
+                .max_decimals(3)
+                .help_text(tr!("water-roughness-help"))
+                .show(ui);
+            MenuFieldF64::new(tr!("water-infiltration"), &mut dialog.settings.infiltration_mm_h, 0.0..=500.0)
+                .width(width)
+                .speed(0.1)
+                .max_decimals(1)
+                .suffix(unit(tr!("water-unit-mm-per-hour")))
+                .help_text(tr!("water-infiltration-help"))
+                .show(ui);
+
+            menu::menu_section(ui, tr!("water-section-solver"));
+            MenuFieldF64::new(tr!("water-step"), &mut dialog.settings.step_s, 1.0..=3600.0)
+                .width(width)
+                .speed(1.0)
+                .max_decimals(0)
+                .suffix(unit(tr!("water-unit-seconds")))
+                .help_text(tr!("water-step-help"))
+                .show(ui);
+            MenuFieldBool::new(tr!("water-subdivide"), &mut dialog.subdivide)
+                .help_text(tr!("water-subdivide-help"))
+                .show(ui);
+            if dialog.subdivide {
+                MenuFieldF64::new(tr!("water-subdivide-length"), &mut dialog.subdivide_m, 0.5..=1000.0)
+                    .width(width)
+                    .speed(0.5)
+                    .max_decimals(1)
+                    .suffix(unit(tr!("common-m")))
+                    .show(ui);
+            }
+
+            let mut settings = dialog.settings;
+            settings.subdivide_m = dialog.subdivide.then_some(dialog.subdivide_m);
+            if settings.is_valid() {
+                tool_help_panel(
+                    ui,
+                    tr!(
+                        "water-run-note",
+                        rate = format!("{:.1}", settings.rain_mm / settings.rain_hours),
+                        steps = format!("{:.0}", (settings.duration_s() / settings.step_s).ceil())
+                    ),
+                );
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            let surface = editor
+                .water_dialog
+                .surface
+                .filter(|id| project.triangulations.iter().any(|entry| entry.id == *id && entry.is_loaded));
+            let can_run = surface.is_some() && settings.is_valid();
+            menu::menu_actions(ui, |ui| {
+                let confirm = menu::dialog_confirmed(ui.ctx());
+                if (ui.add(MenuButton::new(tr!("water-run")).primary().enabled(can_run)).clicked() || (confirm && can_run))
+                    && let Some(surface) = surface
+                {
+                    commands.push(UiCommand::RunWaterSimulation { surface, settings });
+                }
+                if ui.add(MenuButton::new(tr!("common-cancel"))).clicked() || menu::dialog_cancelled(ui.ctx()) {
+                    editor.water_dialog.open = false;
+                }
+            });
+        });
+    if !open {
+        editor.water_dialog.open = false;
     }
 }
 
@@ -3232,7 +3560,7 @@ pub(crate) fn draw_merge_surfaces_dialog(ui: &mut egui::Ui, editor: &mut EditorS
             // Also when the dialog opened with the first surface chosen from
             // the selection, and so has no name yet.
             if (editor.tri_merge_first_id != old_first || editor.tri_merge_name_input.is_empty()) && editor.tri_merge_name_auto && editor.tri_merge_first_id.is_some() {
-                editor.tri_merge_name_input = crate::app::canvas::derived_triangulation_name(&name_of(editor.tri_merge_first_id), &tr!("cmd-commands-merged"));
+                editor.tri_merge_name_input = crate::app::canvas::derived_surface_name(&name_of(editor.tri_merge_first_id), &tr!("cmd-commands-merged"));
             }
 
             ui.add_space(4.0);
@@ -3272,18 +3600,8 @@ pub(crate) fn draw_merge_surfaces_dialog(ui: &mut egui::Ui, editor: &mut EditorS
             ui.add_space(6.0);
             ui.separator();
 
-            let is_loaded = |id: Option<TriangulationId>| id.is_some_and(|id| loaded.iter().any(|(loaded_id, _)| *loaded_id == id));
-            let blocker = if !is_loaded(editor.tri_merge_first_id) {
-                Some(tr!("tri-merge-need-first"))
-            } else if !is_loaded(editor.tri_merge_second_id) {
-                Some(tr!("tri-merge-need-second"))
-            } else if editor.tri_merge_first_id == editor.tri_merge_second_id {
-                Some(tr!("tri-merge-need-different"))
-            } else if editor.tri_merge_name_input.trim().is_empty() {
-                Some(tr!("tri-merge-need-name"))
-            } else {
-                None
-            };
+            let entry_of = |id: Option<TriangulationId>| project.triangulations.iter().find(|entry| entry.is_loaded && Some(entry.id) == id);
+            let blocker = merge_surfaces_blocker(entry_of(editor.tri_merge_first_id), entry_of(editor.tri_merge_second_id), &editor.tri_merge_name_input);
             let can_run = blocker.is_none();
 
             menu::menu_actions(ui, |ui| {
@@ -3311,4 +3629,23 @@ pub(crate) fn draw_merge_surfaces_dialog(ui: &mut egui::Ui, editor: &mut EditorS
     if !open {
         editor.tri_merge_open = false;
     }
+}
+
+/// Why Merge Surfaces cannot run yet, from the two loaded surfaces chosen and
+/// the name typed; `None` when it can. Surfaces whose qualities differ are
+/// refused here as the command refuses them.
+fn merge_surfaces_blocker(first: Option<&crate::ui::state::UiTriangulationEntry>, second: Option<&crate::ui::state::UiTriangulationEntry>, name: &str) -> Option<String> {
+    let Some(first) = first else {
+        return Some(tr!("tri-merge-need-first"));
+    };
+    let Some(second) = second else {
+        return Some(tr!("tri-merge-need-second"));
+    };
+    if first.id == second.id {
+        return Some(tr!("tri-merge-need-different"));
+    }
+    if let Err(refusal) = crate::app::commands::triangulation::session::shared_quality((&first.name, first.quality.as_ref()), (&second.name, second.quality.as_ref())) {
+        return Some(refusal.to_string());
+    }
+    name.trim().is_empty().then(|| tr!("tri-merge-need-name"))
 }

@@ -463,6 +463,8 @@ pub(crate) enum MenuRow {
     MergeShellIntoTopology,
     BuildSolidFromSurfaces,
     GenerateContours,
+    Simplify,
+    SimulateWater,
     PitOptimization,
     UndrapeAllRasters,
     CreateOreTriangulation,
@@ -539,6 +541,9 @@ pub(crate) enum MenuTitle {
     GeologyVertices,
     GeologySurface,
     Modelling,
+    ModellingPrismoidGrids,
+    ModellingMasks,
+    ModellingBlockModels,
 }
 
 impl MenuTitle {
@@ -560,6 +565,9 @@ impl MenuTitle {
             Self::GeologyVertices => tr!("ws-menubar-geology-vertices"),
             Self::GeologySurface => tr!("ws-menubar-geology-surface"),
             Self::Modelling => tr!("ws-menubar-modelling"),
+            Self::ModellingPrismoidGrids => tr!("ws-menubar-modelling-prismoid-grids"),
+            Self::ModellingMasks => tr!("ws-menubar-modelling-masks"),
+            Self::ModellingBlockModels => tr!("ws-menubar-modelling-block-models"),
         }
     }
 }
@@ -600,7 +608,9 @@ const PRODUCTION_MENUS: &[WorkspaceMenu] = &[
         groups: &[
             rows(&[MenuRow::ClipSurfaceByPolyline, MenuRow::SliceSurfaceByZ, MenuRow::TrimTopology, MenuRow::ClipToSurface]),
             rows(&[MenuRow::CutTopologyByPitShell, MenuRow::MergeShellIntoTopology, MenuRow::BuildSolidFromSurfaces]),
+            rows(&[MenuRow::Simplify]),
             rows(&[MenuRow::GenerateContours]),
+            rows(&[MenuRow::SimulateWater]),
         ],
     },
     // Pit optimization works over a block model, but it opens on its
@@ -717,22 +727,22 @@ const GEOLOGY_MENUS: &[WorkspaceMenu] = &[
             rows(&[MenuRow::ReferencePoints, MenuRow::ReferenceSurface]),
             rows(&[MenuRow::ThicknessPoints, MenuRow::ThicknessSurfaces]),
             rows(&[MenuRow::ModellingClipToSurface]),
-            rows(&[
-                MenuRow::BuildPrismoidGrid,
-                MenuRow::BuildStrata,
-                MenuRow::BlockModelFromPrismoidGrid,
-                MenuRow::RegularBlockModel,
-                MenuRow::PrismoidQualities,
-                MenuRow::PrismoidGridToSurface,
-                MenuRow::DifferencePrismoidGrids,
-                MenuRow::MisfitAtHoles,
-                MenuRow::MaskPrismoidGridByPolyline,
-                // One row masks the selected prismoids, or picks them first,
-                // and, ticked when all are masked by hand, unmasks them.
-                MenuRow::MaskPrismoids,
-                MenuRow::UnmaskAllPrismoids,
-                MenuRow::TrimPrismoidGrids,
-            ]),
+            submenu(
+                MenuTitle::ModellingPrismoidGrids,
+                &[MenuRow::BuildPrismoidGrid, MenuRow::BuildStrata, MenuRow::PrismoidQualities, MenuRow::TrimPrismoidGrids],
+            ),
+            submenu(
+                MenuTitle::ModellingMasks,
+                &[
+                    MenuRow::MaskPrismoidGridByPolyline,
+                    // One row masks the selected prismoids, or picks them first,
+                    // and, ticked when all are masked by hand, unmasks them.
+                    MenuRow::MaskPrismoids,
+                    MenuRow::UnmaskAllPrismoids,
+                ],
+            ),
+            submenu(MenuTitle::ModellingBlockModels, &[MenuRow::BlockModelFromPrismoidGrid, MenuRow::RegularBlockModel]),
+            rows(&[MenuRow::MisfitAtHoles, MenuRow::DifferencePrismoidGrids, MenuRow::PrismoidGridToSurface]),
         ],
     },
 ];
@@ -808,6 +818,8 @@ impl MenuRow {
             Self::MergeShellIntoTopology => tr!("common-merge-shell-into-topology-ellipsis"),
             Self::BuildSolidFromSurfaces => tr!("menu-build-solid-surfaces"),
             Self::GenerateContours => tr!("common-generate-contour-lines"),
+            Self::Simplify => tr!("simplify-menu"),
+            Self::SimulateWater => tr!("water-simulate-ellipsis"),
             Self::PitOptimization => tr!("menu-pit-optimization"),
             Self::UndrapeAllRasters => tr!("common-undrape-all"),
             Self::CreateOreTriangulation => tr!("common-create-ore-triangulation-ellipsis"),
@@ -926,6 +938,8 @@ impl MenuRow {
             Self::MergeShellIntoTopology => UiCommand::OpenIncludeSolidInTopology,
             Self::BuildSolidFromSurfaces => UiCommand::OpenBuildSolidFromSurfaces,
             Self::GenerateContours => UiCommand::OpenContourTriangulation,
+            Self::Simplify => UiCommand::OpenSimplifyTriangulation,
+            Self::SimulateWater => UiCommand::OpenWaterSimulation,
             Self::PitOptimization => UiCommand::OpenOptimizationScenarios,
             Self::UndrapeAllRasters => UiCommand::UndrapeAllRasters,
             Self::CreateOreTriangulation => UiCommand::OpenCreateOreTriangulation,
@@ -989,7 +1003,7 @@ impl MenuRow {
             // dialog states and changes with Pick. Insert at Intersection has
             // no dialog, and opens straight into the pick when the selection
             // has nothing to cross.
-            Self::InsertAtIntersection | Self::InsertAtElevation | Self::SetAxis(_) | Self::CreateTriangulation | Self::ReferencePoints | Self::ReferenceSurface => true,
+            Self::InsertAtIntersection | Self::InsertAtElevation | Self::SetAxis(_) | Self::CreateTriangulation => true,
             // The tools taking two surfaces pick both in their dialog.
             Self::TrimTopology | Self::CutTopologyByPitShell | Self::MergeShellIntoTopology | Self::BuildSolidFromSurfaces | Self::PitOptimization | Self::SurveyDefinitions => {
                 true
@@ -997,36 +1011,26 @@ impl MenuRow {
             Self::UndrapeAllRasters => project.raster_textures.iter().any(|raster| raster.is_draped),
             // These work on one named item, which their dialog lists: the
             // selection only saves choosing it there.
-            Self::ClipSurfaceByPolyline | Self::SliceSurfaceByZ | Self::GenerateContours | Self::PointCloudTin | Self::PointCloudJoin | Self::PointCloudClassify => true,
+            Self::ClipSurfaceByPolyline
+            | Self::SliceSurfaceByZ
+            | Self::GenerateContours
+            | Self::Simplify
+            | Self::SimulateWater
+            | Self::PointCloudTin
+            | Self::PointCloudJoin
+            | Self::PointCloudClassify => true,
             Self::CreateOreTriangulation | Self::CreateBlockModel | Self::SurveyTransform | Self::NewLayer => project.has_active_project,
-            // Geology's own rows, and the two Clip to Surface rows, wait on
-            // the editor instead; see [`MenuRow::ready`].
-            Self::CleanStrings
+            // Their commands refuse to run with no project open.
+            Self::ReferencePoints
+            | Self::ReferenceSurface
+            | Self::CleanStrings
             | Self::ClipToSurface
-            | Self::Tool(_)
-            | Self::GeologyInsertAtCrossings
-            | Self::GeologyInsertAtElevation
             | Self::GeologyCleanStrings
-            | Self::GeologySetAxis(_)
             | Self::GeologyCreateTriangulation
             | Self::SmoothSurface
             | Self::DifferenceSurfaces
             | Self::CleanSurface
             | Self::MergeSurfaces
-            | Self::InsertAtSpacing
-            | Self::Reverse
-            | Self::DrapeAlongTriangles
-            | Self::Thin
-            | Self::Smooth
-            | Self::RemoveLastVertex
-            | Self::NextVertex
-            | Self::CopyAlongString
-            | Self::CarryOnString
-            | Self::RedrawRun
-            | Self::DragVertex
-            | Self::NudgeRl
-            | Self::SurfaceLines
-            | Self::SaveSurfaceLines
             | Self::ThicknessPoints
             | Self::ThicknessSurfaces
             | Self::ModellingClipToSurface
@@ -1041,8 +1045,66 @@ impl MenuRow {
             | Self::MaskPrismoidGridByPolyline
             | Self::MaskPrismoids
             | Self::UnmaskAllPrismoids
-            | Self::TrimPrismoidGrids => true,
+            | Self::TrimPrismoidGrids => project.has_active_project,
+            // Geology's own rows wait on the editor instead; see
+            // [`MenuRow::ready`].
+            Self::Tool(_)
+            | Self::GeologyInsertAtCrossings
+            | Self::GeologyInsertAtElevation
+            | Self::GeologySetAxis(_)
+            | Self::InsertAtSpacing
+            | Self::Reverse
+            | Self::DrapeAlongTriangles
+            | Self::Thin
+            | Self::Smooth
+            | Self::RemoveLastVertex
+            | Self::NextVertex
+            | Self::CopyAlongString
+            | Self::CarryOnString
+            | Self::RedrawRun
+            | Self::DragVertex
+            | Self::NudgeRl
+            | Self::SurfaceLines
+            | Self::SaveSurfaceLines => true,
         }
+    }
+
+    /// Whether the row is greyed, and not kept as a recent function, with no
+    /// project open: its command refuses to run without one, or, as for
+    /// Survey Transform, its enabled rule asks for one.
+    pub(crate) fn needs_project(self) -> bool {
+        matches!(
+            self,
+            Self::CreateOreTriangulation
+                | Self::CreateBlockModel
+                | Self::SurveyTransform
+                | Self::NewLayer
+                | Self::ReferencePoints
+                | Self::ReferenceSurface
+                | Self::CleanStrings
+                | Self::ClipToSurface
+                | Self::GeologyCleanStrings
+                | Self::GeologyCreateTriangulation
+                | Self::SmoothSurface
+                | Self::DifferenceSurfaces
+                | Self::CleanSurface
+                | Self::MergeSurfaces
+                | Self::ThicknessPoints
+                | Self::ThicknessSurfaces
+                | Self::ModellingClipToSurface
+                | Self::BuildPrismoidGrid
+                | Self::BuildStrata
+                | Self::BlockModelFromPrismoidGrid
+                | Self::RegularBlockModel
+                | Self::PrismoidQualities
+                | Self::PrismoidGridToSurface
+                | Self::DifferencePrismoidGrids
+                | Self::MisfitAtHoles
+                | Self::MaskPrismoidGridByPolyline
+                | Self::MaskPrismoids
+                | Self::UnmaskAllPrismoids
+                | Self::TrimPrismoidGrids
+        )
     }
 
     /// Whether the row can run as the editor stands, beside
@@ -1101,6 +1163,12 @@ impl MenuRow {
         }
     }
 
+    /// Whether the row, just run, joins the recent functions: used, and not
+    /// refused for want of a project.
+    pub(crate) fn kept_as_recent(self, editor: &EditorState, project_open: bool) -> bool {
+        self.was_used(editor) && (project_open || !self.needs_project())
+    }
+
     /// The row's name in a saved recent list: fixed words rather than the
     /// label's text, so a language switch relabels the list without losing
     /// it. Not itself a translation id.
@@ -1119,6 +1187,8 @@ impl MenuRow {
             Self::MergeShellIntoTopology => "ws-menubar-triangulation-merge-shell",
             Self::BuildSolidFromSurfaces => "ws-menubar-triangulation-build-solid",
             Self::GenerateContours => "ws-menubar-triangulation-contours",
+            Self::Simplify => "ws-menubar-triangulation-simplify",
+            Self::SimulateWater => "ws-menubar-triangulation-simulate-water",
             Self::PitOptimization => "ws-menubar-block-model-pit-optimization",
             Self::UndrapeAllRasters => "ws-menubar-raster-undrape-all",
             Self::CreateOreTriangulation => "ws-menubar-block-model-ore-triangulation",

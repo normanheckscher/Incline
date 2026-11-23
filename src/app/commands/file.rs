@@ -117,15 +117,11 @@ fn mesh_format_mime_type(format: MeshFormat) -> &'static str {
 }
 
 /// The name a drillhole dataset's exported files are built on: its own name
-/// without the extension or the collar table's suffix it was imported under.
+/// without the collar table's suffix it was imported under. An imported
+/// name is a file stem, so a dot in it is part of the name, not an extension.
 fn drill_hole_export_stem(name: &str) -> String {
-    Path::new(name)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("drillholes")
-        .trim_end_matches("_collars")
-        .to_owned()
+    let name = name.trim_end_matches("_collars");
+    if name.trim().is_empty() { "drillholes" } else { name }.to_owned()
 }
 
 /// Where the corrections file goes beside a worksheet written to `worksheet`:
@@ -205,6 +201,13 @@ pub(crate) enum FileDialogAction {
     OpenOptimizationReport(PathBuf),
     #[cfg(target_arch = "wasm32")]
     WebOpenOptimizationReport(std::result::Result<crate::model::input::InputFile, String>),
+    /// The schedule's periods file goes here, its pits file beside it.
+    #[cfg(not(target_arch = "wasm32"))]
+    ExportNpvScheduleReport { path: PathBuf, periods: Vec<u8>, pits: Vec<u8> },
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenNpvScheduleReport(PathBuf),
+    #[cfg(target_arch = "wasm32")]
+    WebOpenScheduleReport(std::result::Result<crate::model::input::InputFile, String>),
     #[cfg(not(target_arch = "wasm32"))]
     ExportHaulRoads { project: Box<crate::model::project::ProjectFile>, path: PathBuf },
     #[cfg(not(target_arch = "wasm32"))]
@@ -725,9 +728,10 @@ impl<'a> App<'a> {
                                 self.editor.import_drill_csv.push((mapping, preview));
                             }
                             Err(error) => {
-                                self.editor.import_csv_error = Some(error.to_string());
-                                self.editor.import_drill_csv.clear();
-                                break;
+                                // Left out; the others stay, the first
+                                // failure named.
+                                let failed = tr!("io-drill-csv-preview-failed", file = file_name(path), error = error.to_string());
+                                self.editor.import_csv_error.get_or_insert(failed);
                             }
                         }
                     }
@@ -784,9 +788,8 @@ impl<'a> App<'a> {
                                 self.editor.import_drill_csv.push((mapping, preview));
                             }
                             Err(error) => {
-                                self.editor.import_csv_error = Some(error.to_string());
-                                self.editor.import_drill_csv.clear();
-                                break;
+                                let failed = tr!("io-drill-csv-preview-failed", file = file.source.name.clone(), error = error.to_string());
+                                self.editor.import_csv_error.get_or_insert(failed);
                             }
                         }
                     }
@@ -945,6 +948,19 @@ impl<'a> App<'a> {
                 self.show_optimization_report_file(file.source.name.clone(), &file.bytes)
             }
             #[cfg(not(target_arch = "wasm32"))]
+            FileDialogAction::ExportNpvScheduleReport { path, periods, pits } => self.write_npv_schedule_report_export(path, periods, pits),
+            #[cfg(not(target_arch = "wasm32"))]
+            FileDialogAction::OpenNpvScheduleReport(path) => {
+                let bytes = std::fs::read(&path).with_context(|| format!("Could not read {}", path.display()))?;
+                let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
+                self.show_npv_schedule_report_file(name, &bytes)
+            }
+            #[cfg(target_arch = "wasm32")]
+            FileDialogAction::WebOpenScheduleReport(file) => {
+                let file = file.map_err(anyhow::Error::msg)?;
+                self.show_npv_schedule_report_file(file.source.name.clone(), &file.bytes)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             FileDialogAction::OptimizationReportsFolder(path) => {
                 self.set_optimization_reports_folder(path);
                 Ok(())
@@ -1038,20 +1054,35 @@ impl<'a> App<'a> {
                     vec![bundle.collars, bundle.survey, bundle.intervals]
                 },
                 tr!("err-file-desc-drillhole-csv"),
-                |error| userspace_warn!("{}", tr!("cmd-file-drillhole-csv-export-failed-error", error = format!("{error:#}"))),
+                |result| {
+                    if let Err(error) = result {
+                        userspace_warn!("{}", tr!("cmd-file-drillhole-csv-export-failed-error", error = format!("{error:#}")))
+                    }
+                },
             ),
             #[cfg(target_arch = "wasm32")]
-            FileDialogAction::WebDownloadCorrectionsWorksheet { id, stem } => self.spawn_drill_hole_tables_download(
-                id,
-                tr!("cmd-file-exporting-name", name = stem.clone()),
-                vec![format!("{stem}_worksheet.csv"), format!("{stem}_corrections.csv")],
-                |dataset| {
-                    let tables = crate::model::formats::csv_drill_hole::write_worksheet(dataset);
-                    vec![tables.worksheet, tables.corrections]
-                },
-                tr!("err-file-desc-corrections-worksheet"),
-                |error| userspace_warn!("{}", tr!("cmd-file-worksheet-export-failed-error", error = format!("{error:#}"))),
-            ),
+            FileDialogAction::WebDownloadCorrectionsWorksheet { id, stem } => {
+                let (name, unread) = self
+                    .drill_holes
+                    .iter()
+                    .find(|item| item.id == id)
+                    .map(|item| (item.name.clone(), item.dataset.unread_corrections.len()))
+                    .unwrap_or_default();
+                self.spawn_drill_hole_tables_download(
+                    id,
+                    tr!("cmd-file-exporting-name", name = stem.clone()),
+                    vec![format!("{stem}_worksheet.csv"), format!("{stem}_corrections.csv")],
+                    |dataset| {
+                        let tables = crate::model::formats::csv_drill_hole::write_worksheet(dataset);
+                        vec![tables.worksheet, tables.corrections]
+                    },
+                    tr!("err-file-desc-corrections-worksheet"),
+                    move |result| match result {
+                        Ok(()) => warn_worksheet_leaves_out(&name, unread),
+                        Err(error) => userspace_warn!("{}", tr!("cmd-file-worksheet-export-failed-error", error = format!("{error:#}"))),
+                    },
+                )
+            }
             #[cfg(target_arch = "wasm32")]
             FileDialogAction::WebDownloadBlockModelCsv { id, file_name, close_after } => {
                 let block_model = self
@@ -1962,7 +1993,7 @@ impl<'a> App<'a> {
             return;
         };
         if dataset.dataset.corrections.is_empty() {
-            userspace_warn!("{}", tr!("cmd-file-worksheet-no-corrections", name = dataset.name.clone()));
+            warn_worksheet_has_nothing(&dataset.name, dataset.dataset.unread_corrections.len());
             return;
         }
         let stem = drill_hole_export_stem(&dataset.name);
@@ -1991,12 +2022,13 @@ impl<'a> App<'a> {
             .drill_holes
             .iter()
             .find(|item| item.id == id)
-            .context("The selected drillhole dataset is no longer loaded")?;
+            .with_context(|| tr!("cmd-file-selected-drillhole-dataset-no-longer"))?;
         // The records may have been undone while the save dialog was open.
         if dataset.dataset.corrections.is_empty() {
-            userspace_warn!("{}", tr!("cmd-file-worksheet-no-corrections", name = dataset.name.clone()));
+            warn_worksheet_has_nothing(&dataset.name, dataset.dataset.unread_corrections.len());
             return Ok(());
         }
+        let (name, unread) = (dataset.name.clone(), dataset.dataset.unread_corrections.len());
         if path.extension().is_none() {
             path.set_extension("csv");
         }
@@ -2015,7 +2047,10 @@ impl<'a> App<'a> {
                 vec![tables.worksheet, tables.corrections]
             },
             move |result| match result {
-                Ok(()) => userspace_log!("{message}"),
+                Ok(()) => {
+                    userspace_log!("{message}");
+                    warn_worksheet_leaves_out(&name, unread);
+                }
                 Err(error) => userspace_warn!("{}", tr!("cmd-file-worksheet-export-failed-error", error = format!("{error:#}"))),
             },
         )
@@ -2027,7 +2062,7 @@ impl<'a> App<'a> {
             .iter()
             .find(|item| item.id == id)
             .cloned()
-            .context("The selected drillhole dataset is no longer loaded")
+            .with_context(|| tr!("cmd-file-selected-drillhole-dataset-no-longer"))
     }
 
     /// Write the tables `tables` makes of one drillhole dataset in the
@@ -2077,7 +2112,7 @@ impl<'a> App<'a> {
         file_names: Vec<String>,
         tables: fn(&crate::model::drill_hole::DrillHoleDataset) -> Vec<String>,
         what: String,
-        failed: impl FnOnce(anyhow::Error) + 'static,
+        done: impl FnOnce(Result<()>) + 'static,
     ) -> Result<()> {
         let snapshot = self.drill_hole_export_snapshot(id)?;
         self.spawn_job(
@@ -2092,13 +2127,12 @@ impl<'a> App<'a> {
                 };
                 Ok(tables(&item.dataset))
             },
-            move |_app, result| match result {
-                Ok(texts) => {
+            move |_app, result| {
+                done(result.map(|texts| {
                     for (file_name, text) in file_names.into_iter().zip(texts) {
                         Self::trigger_browser_download(file_name, text.into_bytes(), "text/csv", what.clone());
                     }
-                }
-                Err(error) => failed(error),
+                }))
             },
         );
         Ok(())
@@ -2244,6 +2278,8 @@ impl<'a> App<'a> {
     /// Save the project when its stored copy is missing or out of date.
     /// Returns false when Save As is still pending for a never-saved project.
     pub(crate) fn save_dirty_project(&mut self) -> Result<bool> {
+        // The playback deck's column is not the project's: never saved.
+        self.close_field_animation();
         if self.has_pending_move_delta() {
             self.commit_pending_move();
         }
@@ -2448,6 +2484,8 @@ impl<'a> App<'a> {
     }
 
     pub(crate) fn save_project(&mut self, runtime_id: u32) -> Result<()> {
+        // The playback deck's column is not the project's: never saved.
+        self.close_field_animation();
         #[cfg(not(target_arch = "wasm32"))]
         if self.project_revert_is_pending(runtime_id) {
             anyhow::bail!(tr!("err-file-wait-revert-save"));
@@ -2965,7 +3003,9 @@ impl<'a> App<'a> {
             // a folder deleted since the last save must stay gone even
             // though the file on disk still names it.
             design.folders = live_folders;
-            let scenarios_json = |file: &crate::model::optimization::ScenarioFile| serde_json::to_string(&(&file.scenarios, &file.report_columns)).unwrap_or_default();
+            let scenarios_json = |file: &crate::model::optimization::ScenarioFile| {
+                serde_json::to_string(&(&file.scenarios, &file.report_columns, &file.animation_speed, &file.schedule_columns, &file.constants)).unwrap_or_default()
+            };
             let optimization_diverges = scenarios_json(&live_optimization) != scenarios_json(&bundle.optimization.unwrap_or_default());
             design.optimization = live_optimization;
             let folder_map = reloaded_folder_map(&design.folders, &bundle.folders);
@@ -3331,4 +3371,22 @@ fn write_browser_project_record(
             result,
         });
     });
+}
+
+/// Say why a worksheet cannot be made: the set has no corrections, or
+/// only records this build cannot read (`unread` of them).
+fn warn_worksheet_has_nothing(name: &str, unread: usize) {
+    if unread > 0 {
+        userspace_warn!("{}", tr!("cmd-file-worksheet-only-unread-corrections", name = name.to_owned(), count = unread.to_string()));
+    } else {
+        userspace_warn!("{}", tr!("cmd-file-worksheet-no-corrections", name = name.to_owned()));
+    }
+}
+
+/// Say that a worksheet just written leaves out `unread` records this
+/// build cannot read.
+fn warn_worksheet_leaves_out(name: &str, unread: usize) {
+    if unread > 0 {
+        userspace_warn!("{}", tr!("cmd-file-worksheet-leaves-out-unread", name = name.to_owned(), count = unread.to_string()));
+    }
 }

@@ -29,7 +29,10 @@ use crate::{
             BlockBounds, BlockBoundsSource, BlockGeometry, BlockGeometryBuilder, Boundary, ColorTransferFunction, LoadedBlockModel, OpenBlockModel, RenderableBlockIndices,
             StoredColorTransferFunction, compute_world_bounds, opaque_irregular_surface_block_count, opaque_surface_block_count,
         },
-        drill_hole::{DrillHole, DrillHoleDataset, DrillHoleSource, DrillValue, LoadedDrillHoleDataset, OpenDrillHoleDataset, OrientationSource, skipped_working_sections},
+        drill_hole::{
+            DrillHole, DrillHoleDataset, DrillHoleSource, DrillValue, LoadedDrillHoleDataset, OpenDrillHoleDataset, OrientationSource, saved_too_few_color_stops,
+            skipped_strat_columns, skipped_strat_field, skipped_working_sections,
+        },
         formats::{
             block_column::{BlockColumn, BlockColumnBuilder},
             block_model_data::{BlockModelColumn, BlockModelData},
@@ -43,7 +46,7 @@ use crate::{
         progress::Phase,
         project::{self, ModellingSettings, ProjectFile, ProjectMetadata},
         raster::{LoadedRasterTexture, OpenRasterTexture},
-        triangulation::{GeometryVersion, LoadedTriangulation, OpenTriangulation, QualityMark, spatial_surface_face_order},
+        triangulation::{GeometryVersion, LoadedTriangulation, OpenTriangulation, QualityMark, quality_key, same_quality_name, spatial_surface_face_order},
     },
     rendering::color::{linear_to_srgb_byte, rgb_bytes_to_linear_rgba},
 };
@@ -95,6 +98,10 @@ const META_ORIENTATION_SOURCES: &str = "incline:orientation_sources";
 /// As-logged values of corrected intervals, keyed like the render ranges: per
 /// hole, pairs of interval index and what the site sent.
 const META_LOGGED_INTERVALS: &str = "incline:logged_intervals";
+/// As-logged values a build could not read or place, apart from the logged
+/// intervals so no build applies them to a row: each the hole key it was saved
+/// under and the value as saved.
+const META_UNREAD_LOGGED: &str = "incline:unread_logged_intervals";
 /// The dataset's correction records, whatever their status.
 const META_CORRECTIONS: &str = "incline:corrections";
 /// The category on every drillhole row naming the hole it belongs to.
@@ -155,6 +162,7 @@ const KNOWN_ELEMENT_METADATA: &[&str] = &[
     META_RENDER_RANGES,
     META_ORIENTATION_SOURCES,
     META_LOGGED_INTERVALS,
+    META_UNREAD_LOGGED,
     META_CORRECTIONS,
     META_TIE_INS,
     META_CHARGES,
@@ -1410,16 +1418,60 @@ fn write_block_model_arrays<W: Write + Seek + Send>(writer: &mut omf_crate::file
     Ok(element)
 }
 
+/// Whether a validation warning only says a prismoid roof's hand mask and a
+/// value saved under the same name before it was reserved share the name
+/// `masked`; reading renames the value.
+fn is_prismoid_mask_name_repeat(elements: &[omf_crate::Element], problem: &omf_crate::validate::Problem) -> bool {
+    if problem.reason != omf_crate::validate::Reason::SoftNotUnique("\"masked\"".to_owned()) {
+        return false;
+    }
+    elements.iter().any(|element| {
+        let omf_crate::Geometry::Composite(composite) = &element.geometry else { return false };
+        composite.elements.iter().any(|roof| {
+            let is_mask = |attribute: &omf_crate::Attribute| matches!(attribute.data, omf_crate::AttributeData::Boolean { .. }) && attribute.name == "masked";
+            let is_values = |attribute: &omf_crate::Attribute| matches!(attribute.data, omf_crate::AttributeData::Number { .. }) && attribute.name == "masked";
+            kind(roof) == Some("prismoid_roof")
+                && Some(roof.name.as_str()) == problem.name.as_deref()
+                && roof.attributes.iter().filter(|attribute| attribute.name == "masked").count() == 2
+                && roof.attributes.iter().any(is_mask)
+                && roof.attributes.iter().any(is_values)
+        })
+    })
+}
+
+/// Rename a value a file saved before the name was reserved holds as `masked`
+/// to the first free "name (2)", "name (3)", ... by quality key. Returns the
+/// name given, as at most one value of a grid that passes `check` is so named.
+fn rename_values_named_as_the_mask(cell_values: &mut [CellValues]) -> Option<String> {
+    let mut renamed = None;
+    let mut taken = cell_values.iter().map(|values| quality_key(&values.name)).collect::<BTreeSet<_>>();
+    for values in cell_values.iter_mut().filter(|values| same_quality_name(&values.name, "masked")) {
+        let base = values.name.trim().to_owned();
+        let free = (2u64..).map(|suffix| format!("{base} ({suffix})")).find(|name| !taken.contains(&quality_key(name)));
+        if let Some(name) = free {
+            taken.insert(quality_key(&name));
+            values.name = name.clone();
+            renamed = Some(name);
+        }
+    }
+    renamed
+}
+
 /// Write a prismoid grid as standard OMF elements under one composite: the
 /// roof and the floor as grid surfaces on the one lattice, each carrying the
 /// active-cell mask, and the walls round the active cells as a surface. The
 /// cells masked by hand, when any is, and the cell values ride on the roof,
 /// each set of values with its unit.
 fn write_prismoid_grid<W: Write + Seek + Send>(writer: &mut omf_crate::file::Writer<W>, open: &OpenPrismoidGrid) -> Result<omf_crate::Element> {
+    open.grid.check().with_context(|| tr!("err-omf-prismoid-grid", name = open.name.clone()))?;
+    prismoid_grid_element(writer, open)
+}
+
+/// The elements of a grid already checked, as [`write_prismoid_grid`] writes.
+fn prismoid_grid_element<W: Write + Seek + Send>(writer: &mut omf_crate::file::Writer<W>, open: &OpenPrismoidGrid) -> Result<omf_crate::Element> {
     use omf_crate::{Attribute, Element, GridSurface, Location, Orient2, Surface};
 
     let grid = &open.grid;
-    grid.check().with_context(|| tr!("err-omf-prismoid-grid", name = open.name.clone()))?;
     let lattice = &grid.lattice;
     let horizontal = |plan: DVec2| [plan.x, plan.y, 0.0];
     let orient = Orient2::new(horizontal(lattice.origin), horizontal(lattice.u), horizontal(lattice.v));
@@ -1524,7 +1576,8 @@ fn lattice_grid<W: Write + Seek + Send>(writer: &mut omf_crate::file::Writer<W>,
 /// as one line set, and intervals as one line set whose segments are the
 /// intervals themselves. Every row carries a `Hole` category naming its hole,
 /// so the dataset regroups exactly, and the arrays are the only copy of the
-/// data - nothing is repeated in metadata.
+/// data. Metadata holds what the arrays cannot, such as corrections, never
+/// a second copy of a row.
 fn write_drill_holes<W: Write + Seek + Send>(writer: &mut omf_crate::file::Writer<W>, open: &OpenDrillHoleDataset) -> Result<Option<omf_crate::Element>> {
     use omf_crate::{Attribute, Element, LineSet, Location, PointSet};
 
@@ -1700,8 +1753,23 @@ fn write_drill_holes<W: Write + Seek + Send>(writer: &mut omf_crate::file::Write
     if !logged_intervals.is_empty() {
         put(&mut element, META_LOGGED_INTERVALS, Value::Object(logged_intervals));
     }
-    if !open.dataset.corrections.is_empty() {
-        put(&mut element, META_CORRECTIONS, serde_json::to_value(&open.dataset.corrections)?);
+    if !open.dataset.unread_logged.is_empty() {
+        let kept = open.dataset.unread_logged.iter().map(|(key, value)| json!([key, value])).collect();
+        put(&mut element, META_UNREAD_LOGGED, Value::Array(kept));
+    }
+    if !open.dataset.corrections.is_empty() || !open.dataset.unread_corrections.is_empty() {
+        // Unread records go back where they were saved: before the readable
+        // record whose index is at least their count, else at the end.
+        let mut unread = open.dataset.unread_corrections.iter().peekable();
+        let mut records = Vec::new();
+        for (index, correction) in open.dataset.corrections.iter().enumerate() {
+            while let Some((_, record)) = unread.next_if(|(count, _)| *count <= index) {
+                records.push(record.clone());
+            }
+            records.push(serde_json::to_value(correction)?);
+        }
+        records.extend(unread.map(|(_, record)| record.clone()));
+        put(&mut element, META_CORRECTIONS, Value::Array(records));
     }
     if !open.dataset.derived_columns.is_empty() {
         put(&mut element, META_DERIVED_COLUMNS, serde_json::to_value(&open.dataset.derived_columns)?);
@@ -2271,6 +2339,11 @@ fn read_container<R: omf_crate::file::ReadAt>(source_name: &str, archive: R, bac
             .warnings
             .push(tr!("omf-unsupported-metadata-keys", keys = unsupported_project_metadata.join(", ").to_string()));
     }
+    let problems = problems
+        .into_vec()
+        .into_iter()
+        .filter(|problem| !is_prismoid_mask_name_repeat(&project.elements, problem))
+        .collect::<Vec<_>>();
     if !problems.is_empty() {
         bundle.warnings.push(tr!("omf-validation-warnings", warnings = format!("{problems:?}")));
     }
@@ -2528,17 +2601,48 @@ impl<R: omf_crate::file::ReadAt> Decoder<'_, R> {
 
     /// Warn once when a drill-hole dataset's saved `incline:style` JSON named
     /// working sections the lenient reader had to pass over, so a malformed
-    /// entry stays visible without resetting the colours saved beside it.
+    /// entry stays visible without resetting the colours saved beside it. A
+    /// colour state unreadable as a whole is reported by the next function.
     /// Shared by the deferred and resident drill-hole read paths: `walk`
     /// sends a given element through exactly one of them per decode, so
     /// calling this from both never doubles the warning for one load.
     fn warn_skipped_working_sections(&mut self, name: &str, style: Option<&Value>) {
-        let Some(color) = style.and_then(|style| style.get("color")) else { return };
+        let Some(color) = style.and_then(|style| style.get("color")).filter(|color| !drill_color_unreadable(color)) else {
+            return;
+        };
         let count = skipped_working_sections(color);
         if count > 0 {
             self.bundle
                 .warnings
                 .push(tr!("omf-element-name-has-count-unreadable", name = name.to_string(), count = count.to_string()));
+        }
+        let count = skipped_strat_columns(color);
+        if count > 0 {
+            self.bundle
+                .warnings
+                .push(tr!("omf-element-name-has-count-unreadable-strat", name = name.to_string(), count = count.to_string()));
+        }
+    }
+
+    /// Warn for each other part of a drill-hole dataset's saved style the
+    /// lenient readers had to pass over or replace, once per load as above.
+    fn warn_unreadable_style_parts(&mut self, name: &str, style: Option<&Value>) {
+        let name = name.to_string();
+        if let Some(color) = style.and_then(|style| style.get("color")) {
+            // A state lost as a whole is said once, not part by part.
+            if drill_color_unreadable(color) {
+                self.bundle.warnings.push(tr!("omf-element-name-color-unreadable", name = name.clone()));
+            } else {
+                if skipped_strat_field(color) {
+                    self.bundle.warnings.push(tr!("omf-element-name-strat-field-unreadable", name = name.clone()));
+                }
+                if saved_too_few_color_stops(color) {
+                    self.bundle.warnings.push(tr!("omf-element-name-color-stops-unreadable", name = name.clone()));
+                }
+            }
+        }
+        if geophysics_unreadable(style) {
+            self.bundle.warnings.push(tr!("omf-element-name-geophysics-unreadable", name = name));
         }
     }
 
@@ -2599,6 +2703,7 @@ impl<R: omf_crate::file::ReadAt> Decoder<'_, R> {
             let section = self.element_section(element, MemberKind::DrillHole);
             let folder = self.element_folder(element, section);
             self.warn_skipped_working_sections(&name, style);
+            self.warn_unreadable_style_parts(&name, style);
             self.bundle.drill_holes.push(ImportedDrillHoles {
                 preferred_id,
                 source_name,
@@ -2616,7 +2721,7 @@ impl<R: omf_crate::file::ReadAt> Decoder<'_, R> {
                     name,
                     dataset: Arc::new(DrillHoleDataset::new(Vec::new())),
                 },
-                color: style_value(style, "color").unwrap_or_else(crate::model::drill_hole::DrillColorState::for_logged_holes),
+                color: style_drill_color(style),
                 geophysics: style_geophysics(style),
                 folder,
                 section,
@@ -3803,6 +3908,7 @@ impl<R: omf_crate::file::ReadAt> Decoder<'_, R> {
             Some(cut) => self.read_prismoid_cut(cut, &lattice, name)?,
             None => CutPrismoids::default(),
         };
+        let renamed = rename_values_named_as_the_mask(&mut cell_values);
         let grid = PrismoidGrid {
             lattice,
             roof: elevations(roof_heights),
@@ -3818,19 +3924,38 @@ impl<R: omf_crate::file::ReadAt> Decoder<'_, R> {
         if let Some(None) = stratum {
             self.bundle.warnings.push(tr!("omf-prismoid-stratum-dropped", name = name.to_string()));
         }
-        let built_from = element.metadata.get(META_BUILT_FROM).map(|record| BuildRecord::deserialize(record).ok());
+        let mut built_from = element.metadata.get(META_BUILT_FROM).map(|record| BuildRecord::deserialize(record).ok());
         if let Some(None) = built_from {
             self.bundle.warnings.push(tr!("omf-prismoid-record-dropped", name = name.to_string()));
+        }
+        let (mut color_by, shaded) = (style_value::<PrismoidColorBy>(style, "color_by"), style_value::<bool>(style, "shaded"));
+        if let Some(new) = &renamed {
+            // The colour choice and the record named the value before its rename.
+            let renamed_value = |value: &mut String| {
+                if same_quality_name(value, "masked") {
+                    value.clone_from(new);
+                }
+            };
+            color_by.iter_mut().filter_map(|color| color.value.as_mut()).for_each(renamed_value);
+            built_from
+                .iter_mut()
+                .flatten()
+                .flat_map(|record| record.values.iter_mut())
+                .for_each(|source| renamed_value(&mut source.value));
+        }
+        let present = |key: &str| style.and_then(|style| style.get(key)).is_some();
+        if (color_by.is_none() && present("color_by")) || (shaded.is_none() && present("shaded")) {
+            self.bundle.warnings.push(tr!("omf-prismoid-style-dropped", name = name.to_string()));
         }
         Ok(LoadedPrismoidGrid {
             name: name.to_owned(),
             color: style_value(style, "color").unwrap_or_else(|| element_color(element, DEFAULT_PRISMOID_GRID_COLOR)),
             summary: grid.summary(),
             grid: Arc::new(grid),
-            color_by: style_value(style, "color_by").unwrap_or_default(),
+            color_by: color_by.unwrap_or_default(),
             stratum: stratum.flatten(),
             built_from: built_from.flatten(),
-            shaded: style_value(style, "shaded").unwrap_or(false),
+            shaded: shaded.unwrap_or(false),
         })
     }
 
@@ -4044,35 +4169,63 @@ impl<R: omf_crate::file::ReadAt> Decoder<'_, R> {
                 }
             }
         }
-        if let Some(logged) = element.metadata.get(META_LOGGED_INTERVALS).and_then(Value::as_object) {
-            for (index, pairs) in logged {
-                let (Some(hole), Some(pairs)) = (index.parse::<usize>().ok().and_then(|index| holes.get_mut(index)), pairs.as_array()) else {
-                    continue;
-                };
-                for pair in pairs {
-                    if let Ok((slot, logged)) = <(usize, crate::model::drill_hole::LoggedInterval)>::deserialize(pair)
-                        && let Some(interval) = hole.intervals.get_mut(slot)
-                    {
-                        interval.logged = Some(logged);
+        // What cannot be read or placed is kept with its hole key and never
+        // applied. A save writes it back apart from the readable pairs, under
+        // its own key, so no slot is ever applied to a row and the value
+        // comes back word for word.
+        let mut unread_logged: Vec<(String, Value)> = Vec::new();
+        if let Some(logged) = element.metadata.get(META_LOGGED_INTERVALS) {
+            match logged.as_object() {
+                None => unread_logged.push((String::new(), logged.clone())),
+                Some(logged) => {
+                    for (index, pairs) in logged {
+                        let Some(list) = pairs.as_array() else {
+                            unread_logged.push((index.clone(), pairs.clone()));
+                            continue;
+                        };
+                        let Some(hole) = index.parse::<usize>().ok().and_then(|index| holes.get_mut(index)) else {
+                            unread_logged.extend(list.iter().map(|pair| (index.clone(), pair.clone())));
+                            continue;
+                        };
+                        for pair in list {
+                            match <(usize, crate::model::drill_hole::LoggedInterval)>::deserialize(pair) {
+                                Ok((slot, logged)) if slot < hole.intervals.len() => hole.intervals[slot].logged = Some(logged),
+                                _ => unread_logged.push((index.clone(), pair.clone())),
+                            }
+                        }
                     }
                 }
             }
+        }
+        // Values an earlier build kept: carried over as read, never applied.
+        // An entry of another shape, or a value that is no list, is kept whole
+        // under the empty key and goes back as `["", entry]`.
+        match element.metadata.get(META_UNREAD_LOGGED) {
+            None => {}
+            Some(Value::Array(kept)) => {
+                for entry in kept {
+                    match <(String, Value)>::deserialize(entry) {
+                        Ok(entry) => unread_logged.push(entry),
+                        Err(_) => unread_logged.push((String::new(), entry.clone())),
+                    }
+                }
+            }
+            Some(whole) => unread_logged.push((String::new(), whole.clone())),
         }
         if holes.is_empty() {
             return Ok(None);
         }
         let mut dataset = DrillHoleDataset::new(holes);
-        // Read record by record: one that cannot be read is left out and
-        // counted, never the whole list with it.
+        dataset.unread_logged = unread_logged;
+        // Read record by record: one that cannot be read is kept as saved,
+        // never applied, and never costs the list the others.
         match element.metadata.get(META_CORRECTIONS).map(Value::as_array) {
             Some(Some(stored)) => {
-                let read: Vec<_> = stored.iter().map(crate::model::drill_hole::Correction::deserialize).collect();
-                let dropped = read.iter().filter(|record| record.is_err()).count();
-                dataset.corrections = read.into_iter().filter_map(Result::ok).collect();
-                if dropped > 0 {
-                    self.bundle
-                        .warnings
-                        .push(crate::i18n::tr!("omf-correction-records-dropped", count = dropped.to_string(), name = element.name.clone()));
+                for record in stored {
+                    match crate::model::drill_hole::Correction::deserialize(record) {
+                        Ok(correction) => dataset.corrections.push(correction),
+                        Err(_) => dataset.unread_corrections.push((dataset.corrections.len(), record.clone())),
+                    }
                 }
             }
             // Corrections that are not a list cannot be counted: all are lost.
@@ -4118,6 +4271,7 @@ impl<R: omf_crate::file::ReadAt> Decoder<'_, R> {
         let folder = self.element_folder(element, section);
         let style = element.metadata.get(META_STYLE);
         self.warn_skipped_working_sections(element_name(element), style);
+        self.warn_unreadable_style_parts(element_name(element), style);
         Ok(Some(ImportedDrillHoles {
             preferred_id: element_id(element),
             source_name: element_source_name(element),
@@ -4132,7 +4286,7 @@ impl<R: omf_crate::file::ReadAt> Decoder<'_, R> {
             },
             deferred: None,
             is_loaded: style_loaded(style),
-            color: style_value(style, "color").unwrap_or_else(crate::model::drill_hole::DrillColorState::for_logged_holes),
+            color: style_drill_color(style),
             geophysics: style_geophysics(style),
             folder,
             section,
@@ -4692,6 +4846,26 @@ fn style_f32(style: Option<&Value>, key: &str) -> Option<f32> {
 
 fn style_value<T: serde::de::DeserializeOwned>(style: Option<&Value>, key: &str) -> Option<T> {
     T::deserialize(style?.get(key)?).ok()
+}
+
+/// A drill-hole dataset's colour state, its ramp never left with too few
+/// stops to edit.
+fn style_drill_color(style: Option<&Value>) -> crate::model::drill_hole::DrillColorState {
+    let mut color = style_value(style, "color").unwrap_or_else(crate::model::drill_hole::DrillColorState::for_logged_holes);
+    color.settle_stops();
+    color
+}
+
+/// Whether a saved colour state is present but cannot be read as a whole.
+fn drill_color_unreadable(color: &Value) -> bool {
+    !color.is_null() && crate::model::drill_hole::DrillColorState::deserialize(color).is_err()
+}
+
+/// Whether the style saved a geophysics link that cannot be read.
+fn geophysics_unreadable(style: Option<&Value>) -> bool {
+    style
+        .and_then(|style| style.get("geophysics"))
+        .is_some_and(|saved| !saved.is_null() && crate::model::geophysics::GeophysicsLink::deserialize(saved).is_err())
 }
 
 /// A drill-hole dataset's geophysics link; a project saved before links has

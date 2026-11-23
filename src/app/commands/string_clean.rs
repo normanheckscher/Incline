@@ -640,6 +640,65 @@ pub(crate) fn replace_rings(rings: &mut Vec<StringRing>, taken: &[ObjectId], fre
     rings.extend(fresh);
 }
 
+/// Take out of `rings` the ones the run leaves in place that name a vertex of
+/// a string it rewrote, each vertex found again on the string as `commands`
+/// leave it; a ring that no longer sits on it is dropped, as is any ring on
+/// a string the run deleted. Put the result back after [`replace_rings`].
+pub(crate) fn renumber_kept_rings(rings: &mut Vec<StringRing>, taken: &[ObjectId], commands: &[Command]) -> Vec<StringRing> {
+    /// Note each string `commands` replace (`Some` of its new vertices) or
+    /// delete (`None`); a later command overrides an earlier one.
+    fn rewritten<'a>(commands: &'a [Command], out: &mut HashMap<ObjectId, Option<&'a [PolyVertex]>>) {
+        for command in commands {
+            match command {
+                Command::Batch(inner) => rewritten(inner, out),
+                Command::Replace {
+                    after: Object::Polyline { id, verts, .. },
+                    ..
+                } => {
+                    out.insert(*id, Some(verts.as_slice()));
+                }
+                Command::DeleteObject { object, .. } => {
+                    out.insert(object.id(), None);
+                }
+                _ => {}
+            }
+        }
+    }
+    let taken: HashSet<ObjectId> = taken.iter().copied().collect();
+    let mut left = HashMap::new();
+    rewritten(commands, &mut left);
+    let renumbered = |ring: &StringRing| !ring.sides.iter().all(|(id, _)| taken.contains(id)) && ring.sides.iter().any(|(id, vertex)| vertex.is_some() && taken.contains(id));
+    rings.retain(|ring| !ring.sides.iter().any(|(id, _)| taken.contains(id) && matches!(left.get(id), Some(None))));
+    let (moved, kept): (Vec<StringRing>, Vec<StringRing>) = std::mem::take(rings).into_iter().partition(renumbered);
+    *rings = kept;
+    moved
+        .into_iter()
+        .filter_map(|mut ring| {
+            let at = ring.at;
+            for (id, vertex) in &mut ring.sides {
+                if vertex.is_some()
+                    && taken.contains(id)
+                    && let Some(new) = left.get(id)
+                {
+                    *vertex = Some(vertex_at((*new)?, at)?);
+                }
+            }
+            Some(ring)
+        })
+        .collect()
+}
+
+/// Every string `commands` replace or delete is one the canvas may edit by
+/// `edits`; a run is applied only then.
+pub(crate) fn run_edits_only(commands: &[Command], edits: impl Fn(ObjectId) -> bool + Copy) -> bool {
+    commands.iter().all(|command| match command {
+        Command::Batch(inner) => run_edits_only(inner, edits),
+        Command::Replace { after, .. } => edits(after.id()),
+        Command::DeleteObject { object, .. } => edits(object.id()),
+        _ => true,
+    })
+}
+
 /// After the rings are replaced: their old projections go, so the next frame
 /// knows the rings are new, and a canvas menu open on one of the old rings
 /// is closed, its index now naming another ring or none. A run can land
@@ -793,13 +852,14 @@ impl<'a> App<'a> {
             return;
         };
         let label = tr!("cmd-string-clean-cleaning-strings");
-        self.begin_run(&label, jobs.iter().map(|job| job.ids.len()).sum(), jobs.len());
+        // The job's label trails off; the lines naming the run do not.
+        let run_label = label.trim_end_matches('\u{2026}').to_owned();
+        self.begin_run(&run_label, jobs.iter().map(|job| job.ids.len()).sum(), jobs.len());
         let compute = move |cancel: &CancelFlag, progress: &Progress| {
             let cleaned = compute_clean(&jobs, &|| cancel.is_cancelled(), &|done, total| progress.set_items(done as u64, total as u64))
                 .map_err(|_| anyhow::Error::new(crate::app::jobs::Cancelled))?;
             Ok((jobs, cleaned))
         };
-        let run_label = label.clone();
         let apply = move |app: &mut App, result: anyhow::Result<(Vec<LayerJob>, Vec<Option<LayerClean>>)>| {
             let (jobs, cleaned) = match result {
                 Ok(done) => done,
@@ -851,13 +911,14 @@ impl<'a> App<'a> {
             return;
         };
         let label = tr!("cmd-string-clean-joining-strings");
-        self.begin_run(&label, with_at.iter().map(|(job, _)| job.ids.len()).sum(), with_at.len());
+        // The job's label trails off; the lines naming the run do not.
+        let run_label = label.trim_end_matches('\u{2026}').to_owned();
+        self.begin_run(&run_label, with_at.iter().map(|(job, _)| job.ids.len()).sum(), with_at.len());
         let compute = move |cancel: &CancelFlag, progress: &Progress| {
             let joined = compute_join(&with_at, &|| cancel.is_cancelled(), &|done, total| progress.set_items(done as u64, total as u64))
                 .map_err(|_| anyhow::Error::new(crate::app::jobs::Cancelled))?;
             Ok((with_at, joined))
         };
-        let run_label = label.clone();
         let apply = move |app: &mut App, result: anyhow::Result<(Vec<JoinJob>, Vec<Option<string_clean::LayerJoin>>)>| {
             let (with_at, joined) = match result {
                 Ok(done) => done,
@@ -879,6 +940,12 @@ impl<'a> App<'a> {
     /// strings it took with the ones it leaves, and say what happened: the
     /// report, then one line on what the run came to.
     fn finish_run(&mut self, plan: RunPlan, label: &str) {
+        // A string locked or hidden while the run worked is not edited.
+        let document = self.active_document();
+        if !run_edits_only(&plan.commands, |id| self.editor.canvas_edits_object(document, id)) {
+            userspace_warn!("{}", tr!("cmd-string-clean-run-refused-locked"));
+            return;
+        }
         if !plan.report.log.is_empty() {
             userspace_log!("{}", plan.report.log.join("\n"));
         }
@@ -900,10 +967,12 @@ impl<'a> App<'a> {
             }
             self.editor.string_numbers.extend(numbers);
         }
+        let renumbered = renumber_kept_rings(&mut self.editor.string_rings, &plan.taken, &plan.commands);
         replace_rings(&mut self.editor.string_rings, &plan.taken, plan.rings);
+        self.editor.string_rings.extend(renumbered);
         forget_ring_menu(&mut self.editor);
         if !plan.commands.is_empty() {
-            self.execute_edit(Command::Batch(plan.commands));
+            self.execute_job_edit(Command::Batch(plan.commands));
         }
         self.invalidate_geometry();
         self.invalidate_overlay();
@@ -912,10 +981,16 @@ impl<'a> App<'a> {
 
     /// Delete the vertex a ring names through the canvas Delete Vertex's own
     /// path, one undo step, and update the rings; said and left alone when
-    /// the string is at its fewest vertices.
+    /// the vertex is gone, the string is locked or hidden, or it is at its
+    /// fewest vertices.
     pub(crate) fn delete_ring_vertex(&mut self, id: ObjectId, vertex: usize) {
+        if let Some(reason) = ring_vertex_refusal(&self.editor, self.active_document(), id, vertex) {
+            userspace_warn!("{}", reason);
+            return;
+        }
+        let closed = matches!(self.active_document().get_object(id), Some(Object::Polyline { closed: true, .. }));
         if self.delete_polyline_vertex(id, vertex) {
-            self.editor.forget_deleted_ring_vertex(id, vertex);
+            self.editor.forget_deleted_ring_vertex_of(id, vertex, closed);
             self.redraw_requested = true;
             return;
         }
@@ -926,4 +1001,19 @@ impl<'a> App<'a> {
             }
         }
     }
+}
+
+/// Why a ring's Delete Vertex is refused before the string is looked at for
+/// its fewest vertices: the vertex is gone, the string is locked, or hidden.
+fn ring_vertex_refusal(editor: &crate::ui::state::EditorState, document: &crate::model::Document, id: ObjectId, vertex: usize) -> Option<String> {
+    let handle = SceneEntityId::Object(id);
+    let layer = match document.get_object(id) {
+        Some(Object::Polyline { verts, layer, .. }) if vertex < verts.len() => *layer,
+        _ => return Some(tr!("object-edit-ring-vertex-gone")),
+    };
+    if editor.locked_layers.contains(&layer) || editor.frozen_handles.contains(&handle) {
+        return Some(tr!("object-edit-ring-string-locked"));
+    }
+    let shown = document.layer(layer).is_some_and(crate::model::Layer::is_visible) && !document.is_object_hidden(id) && !editor.hidden_handles.contains(&handle);
+    (!shown).then(|| tr!("object-edit-ring-string-hidden"))
 }

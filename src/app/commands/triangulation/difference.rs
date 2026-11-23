@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use rayon::prelude::*;
 
-use super::cuts::{PreparedReferenceSurface, for_each_plan_overlap, reference_xy_overlap_area_tolerance};
+use super::cuts::{PreparedReferenceSurface, for_each_plan_overlap_about, reference_xy_overlap_area_tolerance};
 use crate::{
     app::{
         App,
@@ -12,6 +12,7 @@ use crate::{
     i18n::tr,
     model::{
         formats::mesh_data,
+        geometry::triangle_xy_area,
         progress::{Phase, Progress},
         triangulation::{GeneratedTriangulationLog, TriangulationId},
     },
@@ -37,6 +38,62 @@ fn plane_z(triangle: [mesh_data::Vertex; 3], x: f64, y: f64) -> f64 {
     a.z - (nx * (x - a.x) + ny * (y - a.y)) / nz
 }
 
+/// Output points as they are welded: the points kept, in plan about `origin`,
+/// and the cells they sit in.
+struct OutputPoints {
+    origin: glam::DVec2,
+    vertices: Vec<mesh_data::Vertex>,
+    plan: Vec<[f64; 2]>,
+    cells: HashMap<(i64, i64), Vec<u32>>,
+}
+
+impl OutputPoints {
+    /// None yet, for points given about `origin`.
+    fn new(origin: glam::DVec2) -> Self {
+        Self {
+            origin,
+            vertices: Vec::new(),
+            plan: Vec::new(),
+            cells: HashMap::new(),
+        }
+    }
+
+    /// The cell of one coordinate; cells are two welds wide, so a point's
+    /// reach covers at most two per axis.
+    fn cell(value: f64) -> i64 {
+        (value / (2.0 * WELD)).floor() as i64
+    }
+
+    /// The index of the kept point within a weld of `point` (given about the
+    /// origin) in plan and a step in height, or else of `point` kept anew.
+    fn index(&mut self, point: [f64; 3]) -> u32 {
+        let (xs, ys) = (
+            Self::cell(point[0] - WELD)..=Self::cell(point[0] + WELD),
+            Self::cell(point[1] - WELD)..=Self::cell(point[1] + WELD),
+        );
+        for key in xs.flat_map(|x| ys.clone().map(move |y| (x, y))) {
+            let near = self.cells.get(&key).and_then(|sharing| {
+                sharing.iter().copied().find(|&index| {
+                    let at = self.plan[index as usize];
+                    (at[0] - point[0]).abs() <= WELD && (at[1] - point[1]).abs() <= WELD && (self.vertices[index as usize].z - point[2]).abs() <= STEP
+                })
+            });
+            if let Some(found) = near {
+                return found;
+            }
+        }
+        self.vertices.push(mesh_data::Vertex {
+            x: point[0] + self.origin.x,
+            y: point[1] + self.origin.y,
+            z: point[2],
+        });
+        self.plan.push([point[0], point[1]]);
+        let index = (self.vertices.len() - 1) as u32;
+        self.cells.entry((Self::cell(point[0]), Self::cell(point[1]))).or_default().push(index);
+        index
+    }
+}
+
 /// The height of `upper` above `lower` as a surface, exact on the inputs' own
 /// triangles: each plan overlap of an upper and a lower triangle is convex
 /// with both surfaces planar over it, so its difference is planar too. Where
@@ -47,6 +104,15 @@ pub(super) fn difference_mesh(
     cancel: &CancelFlag,
     progress: &Phase,
 ) -> Result<(Vec<mesh_data::Vertex>, Vec<[u32; 3]>)> {
+    // Far from the origin the last bits of a coordinate are worth nanometres,
+    // enough for two copies of one crossing point to weld apart, so triangles
+    // are taken about the middle of the overlap as they are read (no surface
+    // is copied) and the result moved back.
+    let (above, below) = (upper.mesh.bounds(), lower.mesh.bounds());
+    let origin = glam::DVec2::new(
+        (above.min.x.max(below.min.x) + above.max.x.min(below.max.x)) / 2.0,
+        (above.min.y.max(below.min.y) + above.max.y.min(below.max.y)) / 2.0,
+    );
     let upright = reference_xy_overlap_area_tolerance(&lower.mesh);
     let task_count = rayon::current_num_threads().saturating_mul(4).max(1);
     let chunk_size = upper.triangles.len().div_ceil(task_count).max(1);
@@ -62,10 +128,12 @@ pub(super) fn difference_mesh(
             let mut stack = Vec::new();
             let mut overlap = Vec::new();
             for &target in chunk {
-                for_each_plan_overlap(target, &lower.mesh, &lower.spatial, upright, &mut stack, &mut overlap, |lower_triangle, polygon| {
+                let local = target.map(|vertex| mesh_data::Vertex::new(vertex.x - origin.x, vertex.y - origin.y, vertex.z));
+                let plan = local.map(|vertex| glam::DVec2::new(vertex.x, vertex.y));
+                for_each_plan_overlap_about(origin, plan, &lower.mesh, &lower.spatial, upright, &mut stack, &mut overlap, |lower_triangle, polygon| {
                     let at = |index: usize| {
                         let point = polygon[index];
-                        [point.x, point.y, plane_z(target, point.x, point.y) - plane_z(lower_triangle, point.x, point.y)]
+                        [point.x, point.y, plane_z(local, point.x, point.y) - plane_z(lower_triangle, point.x, point.y)]
                     };
                     for index in 1..polygon.len() - 1 {
                         let (a, b, c) = (at(0), at(index), at(index + 1));
@@ -83,31 +151,33 @@ pub(super) fn difference_mesh(
         })
         .collect();
 
-    let mut vertices: Vec<mesh_data::Vertex> = Vec::new();
+    let mut weld = OutputPoints::new(origin);
     let mut faces: Vec<[u32; 3]> = Vec::new();
-    let mut welded: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
     for partial in partials {
+        if cancel.is_cancelled() {
+            anyhow::bail!(crate::app::jobs::Cancelled);
+        }
         for piece in partial? {
-            let face = piece.map(|point| {
-                let key = ((point[0] / WELD).round() as i64, (point[1] / WELD).round() as i64);
-                let sharing = welded.entry(key).or_default();
-                if let Some(&found) = sharing.iter().find(|&&index| (vertices[index as usize].z - point[2]).abs() <= STEP) {
-                    return found;
-                }
-                vertices.push(mesh_data::Vertex {
-                    x: point[0],
-                    y: point[1],
-                    z: point[2],
-                });
-                sharing.push((vertices.len() - 1) as u32);
-                sharing[sharing.len() - 1]
-            });
+            let face = piece.map(|point| weld.index(point));
             if face[0] != face[1] && face[1] != face[2] && face[0] != face[2] {
                 faces.push(face);
             }
         }
     }
-    Ok((vertices, faces))
+    Ok((weld.vertices, faces))
+}
+
+/// `mesh` ready to measure, or why it cannot be: no face with area in plan,
+/// or a fold.
+fn measured(mesh: &mesh_data::Triangulation, surface: &str) -> Result<PreparedReferenceSurface> {
+    let tolerance = reference_xy_overlap_area_tolerance(mesh);
+    if !mesh
+        .face_indices()
+        .any(|face| triangle_xy_area(face.map(|index| mesh.vertices()[index as usize])).abs() > tolerance)
+    {
+        anyhow::bail!(tr!("err-surf-difference-no-faces", surface = surface.to_owned()));
+    }
+    super::cuts::validate_reference_surface(mesh).map_err(|_| anyhow::anyhow!(tr!("err-surf-difference-folds", surface = surface.to_owned())))
 }
 
 impl App<'_> {
@@ -123,7 +193,7 @@ impl App<'_> {
             && let Some(surface) = self.triangulations.iter().find(|surface| surface.id == id && surface.state.loaded)
         {
             self.editor.tri_difference_upper_id = Some(id);
-            self.editor.tri_difference_name_input = crate::app::canvas::derived_triangulation_name(&surface.name, &tr!("cmd-commands-difference"));
+            self.editor.tri_difference_name_input = crate::app::canvas::derived_surface_name(&surface.name, &tr!("cmd-commands-difference"));
         }
     }
 
@@ -150,9 +220,8 @@ impl App<'_> {
         let quantity = mark.name.clone();
 
         let compute = move |cancel: &CancelFlag, progress: &Progress| -> Result<GeneratedTriangulationLog> {
-            let folds = |surface: &str| anyhow::anyhow!(tr!("err-surf-difference-folds", surface = surface.to_owned()));
-            let upper = super::cuts::validate_reference_surface(&upper_mesh).map_err(|_| folds(&upper_name))?;
-            let lower = super::cuts::validate_reference_surface(&lower_mesh).map_err(|_| folds(&lower_name))?;
+            let upper = measured(&upper_mesh, &upper_name)?;
+            let lower = measured(&lower_mesh, &lower_name)?;
             if cancel.is_cancelled() {
                 anyhow::bail!(crate::app::jobs::Cancelled);
             }
@@ -163,9 +232,13 @@ impl App<'_> {
             if faces.is_empty() {
                 anyhow::bail!(tr!("err-surf-difference-no-overlap", upper = upper_name, lower = lower_name));
             }
-            let (thinnest, thickest) = vertices
+            // Over the points the faces use: a piece too thin to keep leaves
+            // its points behind.
+            let (thinnest, thickest) = faces
                 .iter()
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), vertex| (low.min(vertex.z), high.max(vertex.z)));
+                .flatten()
+                .map(|&index| vertices[index as usize].z)
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), z| (low.min(z), high.max(z)));
             let generated = super::session::build_generated_triangulation(name, vertices, faces, TriSurfaceType::Surface, |_| Vec::new())?.with_quality(Some(mark));
             Ok(GeneratedTriangulationLog {
                 generated,

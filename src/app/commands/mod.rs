@@ -3,10 +3,12 @@ pub(crate) mod block_model;
 pub(crate) mod dig_strips;
 pub(crate) mod drawing; // Handles finishing polylines, creating points, etc commands
 pub(crate) mod drill_hole;
+pub(crate) mod field_animation; // The playback deck: a block model played through in the order of a field.
 pub(crate) mod file; // Handles importing, exportings, etc. commands
 pub(crate) mod folder; // Handles explorer folder create/delete/rename/move commands, for every section
 pub(crate) mod haulage;
 pub(crate) mod layer; // Handles creating layers, deleting layers, etc. commands
+pub(crate) mod npv_schedule; // Handles the schedules under optimization scenarios.
 pub(crate) mod object_edit;
 pub(crate) mod omf; // Whole-project Open Mining Format interchange.
 pub(crate) mod optimization; // Handles pit optimization's scenario list, editor and scenarios file.
@@ -53,6 +55,7 @@ impl<'a> App<'a> {
         if self.editor.end_string_rework_for_history_step() {
             self.invalidate_geometry();
         }
+        let seam_surface_ready = self.seam_surface_dialog_ready();
         if self.restore_history_step(undo) {
             return;
         }
@@ -93,6 +96,10 @@ impl<'a> App<'a> {
         // references dangling. Both are settled by the same sweep.
         self.drop_editor_references_to_missing_items();
         self.apply_step_effects(effects);
+        // A step can stale a ready Thickness Surfaces dialog's run.
+        if seam_surface_ready {
+            self.refresh_seam_surface_dialog(true);
+        }
         // An open Thin Strings dialog previews the strings as they were.
         self.refresh_thin_preview(true);
         // A copy's first pick is a vertex number on a string the step may
@@ -203,6 +210,14 @@ impl<'a> App<'a> {
                 | UiCommand::MakeSeamSurface { .. }
                 | UiCommand::OpenCutTriangulationToSurface
                 | UiCommand::ExecuteCutTriangulationToSurface { .. }
+                | UiCommand::OpenSmoothSurface
+                | UiCommand::ExecuteSmoothSurface { .. }
+                | UiCommand::OpenCleanSurface
+                | UiCommand::ExecuteCleanSurface { .. }
+                | UiCommand::OpenDifferenceSurfaces
+                | UiCommand::ExecuteDifferenceSurfaces { .. }
+                | UiCommand::OpenMergeSurfaces
+                | UiCommand::ExecuteMergeSurfaces { .. }
                 | UiCommand::OpenBuildPrismoidGrid
                 | UiCommand::ExecuteBuildPrismoidGrid { .. }
                 | UiCommand::OpenBuildStrata
@@ -1024,13 +1039,19 @@ impl<'a> App<'a> {
                 side,
                 pairs,
                 then_surface,
-            } => self.make_thickness_points(
-                surface,
-                holes,
-                crate::app::commands::thickness_points::ReferenceSeam { field, target, side },
-                pairs,
-                then_surface,
-            ),
+            } => {
+                let result = self.make_thickness_points(
+                    surface,
+                    holes,
+                    crate::app::commands::thickness_points::ReferenceSeam { field, target, side },
+                    pairs,
+                    then_surface,
+                );
+                if result.is_ok() {
+                    self.editor.thickness_points_dialog = None;
+                }
+                result
+            }
             UiCommand::OpenSeamSurface => {
                 self.open_seam_surface();
                 Ok(())
@@ -1047,9 +1068,20 @@ impl<'a> App<'a> {
                 self.editor.hole_misfit_table = self.session.misfit_tables.get(&(runtime_id, layer)).cloned();
                 Ok(())
             }
-            UiCommand::MakeSeamSurface { surface } => self.make_seam_surface(surface),
+            UiCommand::MakeSeamSurface { surface } => {
+                let result = self.make_seam_surface(surface);
+                if result.is_ok() {
+                    self.editor.seam_surface_dialog = None;
+                } else {
+                    // Kept open on the reason, so Make greys and says why.
+                    self.set_seam_surface(surface);
+                }
+                result
+            }
             UiCommand::BuildCollarPoints { holes } => {
-                self.build_collar_points(holes);
+                if self.build_collar_points(holes) {
+                    self.editor.reference_points_dialog = None;
+                }
                 Ok(())
             }
             UiCommand::SetModellingSettings(settings) => {
@@ -1069,7 +1101,9 @@ impl<'a> App<'a> {
                 Ok(())
             }
             UiCommand::BuildReferencePoints { holes, field, target, side } => {
-                self.build_reference_points(holes, field, target, side);
+                if self.build_reference_points(holes, field, target, side) {
+                    self.editor.reference_points_dialog = None;
+                }
                 Ok(())
             }
             UiCommand::InspectDrillHole(hole) => self.inspect_drill_hole(hole),
@@ -1172,6 +1206,11 @@ impl<'a> App<'a> {
                 Ok(())
             }
             UiCommand::SaveOptimizationScenario { scenario, then_close } => self.save_optimization_scenario(*scenario, then_close),
+            UiCommand::OpenOptimizationConstants => {
+                self.open_optimization_constants();
+                Ok(())
+            }
+            UiCommand::SaveOptimizationConstants { rows, then_close } => self.save_optimization_constants(rows, then_close),
             UiCommand::ExportOptimizationScenarios => {
                 self.export_optimization_scenarios();
                 Ok(())
@@ -1211,6 +1250,60 @@ impl<'a> App<'a> {
             }
             UiCommand::CancelOptimizationScenario(id) => {
                 self.cancel_optimization_scenario(id);
+                Ok(())
+            }
+            UiCommand::AddNpvSchedule(parent) => {
+                self.add_npv_schedule(parent);
+                Ok(())
+            }
+            UiCommand::EditNpvSchedule { parent, id } => {
+                self.edit_npv_schedule(parent, id);
+                Ok(())
+            }
+            UiCommand::SaveNpvSchedule { parent, schedule, then_close } => self.save_npv_schedule(parent, *schedule, then_close),
+            UiCommand::DeleteNpvSchedule { parent, id } => self.delete_npv_schedule(parent, id),
+            UiCommand::DuplicateNpvSchedule { parent, id } => self.duplicate_npv_schedule(parent, id),
+            UiCommand::RenameNpvSchedule { parent, id, name } => self.rename_npv_schedule(parent, id, name),
+            UiCommand::MoveNpvSchedule { id, from, to } => self.move_npv_schedule(id, from, to, false),
+            UiCommand::CopyNpvScheduleTo { id, from, to } => self.move_npv_schedule(id, from, to, true),
+            UiCommand::RunNpvSchedule { parent, id } => {
+                // A run of its own writes its period field, even if Run all
+                // queued it before.
+                self.editor.optimization.no_period_field.remove(&id);
+                self.run_npv_schedule(parent, id);
+                Ok(())
+            }
+            UiCommand::RunAllNpvSchedules(parent) => {
+                self.run_all_npv_schedules(parent);
+                Ok(())
+            }
+            UiCommand::PlayNpvScheduleAnimation { parent, id } => {
+                self.play_npv_schedule_animation(parent, id);
+                Ok(())
+            }
+            UiCommand::OpenNpvScheduleResults { parent, id } => {
+                self.open_npv_schedule_results(parent, id);
+                Ok(())
+            }
+            UiCommand::ExportNpvScheduleReport => {
+                self.export_npv_schedule_report();
+                Ok(())
+            }
+            UiCommand::OpenNpvScheduleReport => {
+                self.open_npv_schedule_report();
+                Ok(())
+            }
+            UiCommand::SaveNpvScheduleColumns => {
+                self.ensure_optimization_scenarios_loaded();
+                self.write_optimization_scenarios()
+            }
+            UiCommand::NpvScheduleFromPushbacks { parent, id, factors } => self.npv_schedule_from_pushbacks(parent, id, factors),
+            UiCommand::ApplyFieldAnimation => {
+                self.apply_field_animation();
+                Ok(())
+            }
+            UiCommand::CloseFieldAnimation => {
+                self.close_field_animation();
                 Ok(())
             }
             UiCommand::OpenCreateBlockModel => {
@@ -1509,6 +1602,32 @@ impl<'a> App<'a> {
                 self.set_tool_subject(subject);
                 Ok(())
             }
+            UiCommand::OpenWaterSimulation => {
+                self.open_water_surface();
+                Ok(())
+            }
+            UiCommand::RunWaterSimulation { surface, settings } => self.run_water_simulation(surface, settings),
+            UiCommand::OpenSimplifyTriangulation => {
+                self.open_simplify_surface();
+                Ok(())
+            }
+            UiCommand::SimplifyTriangulation {
+                surface,
+                keep,
+                max_deviation,
+                name,
+                unload_source,
+            } => {
+                let result = self.simplify_triangulation(surface, keep, max_deviation, name, unload_source);
+                if result.is_ok() {
+                    self.editor.simplify_dialog.open = false;
+                }
+                result
+            }
+            UiCommand::CloseWaterRun(id) => {
+                self.close_water_run(id);
+                Ok(())
+            }
             UiCommand::ZoomToExtents => {
                 // Sliced, the fit happens within the section, which therefore stays up.
                 self.zoom_to_extents();
@@ -1601,9 +1720,7 @@ impl<'a> App<'a> {
                 Ok(())
             }
             UiCommand::DeleteRingVertex { id, vertex } => {
-                if self.editor.canvas_edits_object(self.active_document(), id) {
-                    self.delete_ring_vertex(id, vertex);
-                }
+                self.delete_ring_vertex(id, vertex);
                 Ok(())
             }
             UiCommand::ApplyObjectEdit { id, object, close } => {
